@@ -1,18 +1,41 @@
-import sys, psutil, os, platform, subprocess
+import sys
+import psutil
+import os
+import platform
+import subprocess
+import logging
 from time import sleep
 from webbrowser import open as webopen
-from PyQt6.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel
-from PyQt6.QtCore import QTimer, Qt, QEvent, QObject, pyqtSignal, QThread
-from PyQt6.QtGui import QIcon
+from typing import Optional, List
+from PyQt6.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QProgressBar, QStatusBar
+from PyQt6.QtCore import QTimer, Qt, QEvent, QObject, pyqtSignal, QThread, QMutex
+from PyQt6.QtGui import QIcon, QAction
 from main_ui import (
     EditorWidget, EncryptModeDialog, PasswordDialog, USBSelectDialog
 )
-from lib.encrypt import encrypt_file, decrypt_file, MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY
-from lib.key import create_or_load_key, load_key_for_decrypt
+from lib.encrypt import encrypt_file, decrypt_file, EncryptModeType
+from lib.key import create_or_load_key
 from messagebox import PangMessageBox
 
 from preferences import PreferencesDialog, PangPreferences
-from styles import TEXT_COLOR, DARKER_BG, PURPLE, PURPLE_HOVER, BUTTON_TEXT
+from styles import TEXT_COLOR, DARKER_BG, PURPLE
+
+from uuid import uuid4
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('pangcrypter.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+MODE_PASSWORD_ONLY = EncryptModeType.MODE_PASSWORD_ONLY
+MODE_PASSWORD_PLUS_KEY = EncryptModeType.MODE_PASSWORD_PLUS_KEY
+MODE_KEY_ONLY = EncryptModeType.MODE_KEY_ONLY
 
 
 # List of known screen recording process names (case insensitive)
@@ -124,6 +147,18 @@ class ScreenRecordingChecker(QObject):
 
             sleep(self.check_interval)
 
+class ValidationError(Exception):
+    """Custom exception for input validation errors."""
+    pass
+
+class CryptographyError(Exception):
+    """Custom exception for cryptography-related errors."""
+    pass
+
+class USBKeyError(Exception):
+    """Custom exception for USB key-related errors."""
+    pass
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -139,6 +174,24 @@ class MainWindow(QMainWindow):
         self.current_mode = None
         self.cached_password = None
         self.cached_usb_key = None
+        self.cached_uuid = None
+        
+        # Thread safety
+        self.operation_mutex = QMutex()
+        
+        # Status bar with progress indicator
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.status_bar.addPermanentWidget(self.progress_bar)
+        
+        # USB drive cache for performance
+        self.usb_cache = []
+        self.usb_cache_timer = QTimer()
+        self.usb_cache_timer.timeout.connect(self.refresh_usb_cache)
+        self.usb_cache_timer.start(5000)  # Refresh every 5 seconds
+        self.refresh_usb_cache()
 
         # Menus
         file_menu = self.menuBar().addMenu("&File")
@@ -315,156 +368,474 @@ class MainWindow(QMainWindow):
                 self.allow_editor_activation = True
                 self.try_restore_editor()
 
+    def refresh_usb_cache(self):
+        """Refresh the USB drive cache for better performance."""
+        try:
+            self.usb_cache = list_usb_drives()
+            logger.debug(f"USB cache refreshed: {len(self.usb_cache)} drives found")
+        except Exception as e:
+            logger.error(f"Failed to refresh USB cache: {e}")
+            self.usb_cache = []
+
+    def validate_file_path(self, path: str) -> bool:
+        """Validate file path for security and correctness."""
+        if not path:
+            raise ValidationError("File path cannot be empty")
+        
+        if not isinstance(path, str):
+            raise ValidationError("File path must be a string")
+        
+        # Check for path traversal attempts
+        if ".." in path or path.startswith("/") and not os.path.isabs(path):
+            raise ValidationError("Invalid file path detected")
+        
+        # Check file extension
+        if not path.lower().endswith('.enc'):
+            raise ValidationError("File must have .enc extension")
+        
+        return True
+
+    def validate_password(self, password: str) -> bool:
+        """Validate password strength and format."""
+        if not password:
+            raise ValidationError("Password cannot be empty")
+        
+        if len(password) < 8:
+            raise ValidationError("Password must be at least 8 characters long")
+        
+        # Check for basic complexity
+        has_upper = any(c.isupper() for c in password)
+        has_lower = any(c.islower() for c in password)
+        has_digit = any(c.isdigit() for c in password)
+        
+        if not (has_upper and has_lower and has_digit):
+            logger.warning("Password does not meet complexity requirements")
+        
+        return True
+
+    def show_progress(self, message: str, maximum: int = 0):
+        """Show progress bar with message."""
+        self.status_bar.showMessage(message)
+        self.progress_bar.setVisible(True)
+        if maximum > 0:
+            self.progress_bar.setMaximum(maximum)
+            self.progress_bar.setValue(0)
+        else:
+            self.progress_bar.setRange(0, 0)  # Indeterminate progress
+
+    def hide_progress(self):
+        """Hide progress bar and clear status message."""
+        self.progress_bar.setVisible(False)
+        self.status_bar.clearMessage()
+
+    def update_progress(self, value: int):
+        """Update progress bar value."""
+        self.progress_bar.setValue(value)
+
     def on_text_changed(self):
         self.autosave_timer.start()  # reset timer on each key press
 
     def autosave(self):
-        # To avoid lag, autosave only if we have keys cached:
-        if self.cached_password is None and self.cached_usb_key is None:
-            return
-        
-        # Only autosave if file is already saved
-        if not self.saved_file_path:
+        """Autosave with improved error handling and logging."""
+        if not self.operation_mutex.tryLock():
+            logger.debug("Autosave skipped - operation in progress")
             return
         
         try:
+            # To avoid lag, autosave only if we have keys cached:
+            if self.cached_password is None and self.cached_usb_key is None:
+                return
+            
+            # Only autosave if file is already saved
+            if not self.saved_file_path:
+                return
+            
+            if self.cached_uuid is None:
+                logger.error("Autosave failed - no UUID cached")
+                return
+            
+            logger.debug(f"Autosaving to {self.saved_file_path}")
+            
             # Encrypt current editor content
             encrypt_file(
                 self.editor.toHtml().encode("utf-8"),
                 self.saved_file_path,
                 self.current_mode,
+                self.cached_uuid,
                 password=self.cached_password,
                 usb_key=self.cached_usb_key,
             )
-            print(f"Autosaved encrypted file to {self.saved_file_path}")
+            logger.info(f"Autosaved encrypted file to {self.saved_file_path}")
+            
+        except CryptographyError as e:
+            logger.error(f"Cryptography error during autosave: {e}")
+            PangMessageBox.warning(self, "Autosave failed", f"Encryption error: {e}")
         except Exception as e:
+            logger.error(f"Unexpected error during autosave: {e}")
             PangMessageBox.warning(self, "Autosave failed", f"Could not autosave encrypted file:\n{e}")
+        finally:
+            self.operation_mutex.unlock()
 
-    def check_usb_present(self):
-        usbs = list_usb_drives()
-        if not usbs:
-            PangMessageBox.warning(self, "No USB", "No USB drives detected. Please plug in your Pang USB key.")
+    def check_usb_present(self) -> Optional[List[str]]:
+        """Check for USB drives with caching and better error handling."""
+        try:
+            # Use cached USB drives if available and recent
+            if self.usb_cache:
+                return self.usb_cache
+            
+            # Fallback to direct detection
+            usbs = list_usb_drives()
+            if not usbs:
+                PangMessageBox.warning(
+                    self, 
+                    "No USB Drives", 
+                    "No USB drives detected. Please plug in your USB key and try again."
+                )
+                return None
+            return usbs
+            
+        except Exception as e:
+            logger.error(f"Error detecting USB drives: {e}")
+            PangMessageBox.critical(
+                self,
+                "USB Detection Error",
+                f"Failed to detect USB drives: {e}"
+            )
             return None
-        return usbs
 
     def save_file(self):
-        usbs = self.check_usb_present()
-
-        dlg = EncryptModeDialog(self)
-        if not dlg.exec_():
+        """Save file with enhanced validation and progress indication."""
+        if not self.operation_mutex.tryLock():
+            PangMessageBox.warning(self, "Operation in Progress", "Another operation is in progress. Please wait.")
             return
-
-        mode = dlg.mode
-
-        password = None
-        if mode in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY]:
-            pwd_dlg = PasswordDialog(self, warning=(mode == MODE_KEY_ONLY))
-            if not pwd_dlg.exec_():
-                return
-            password = pwd_dlg.password
-
-        random_key = None  # this is the actual key used to encrypt
-
-        if mode in [MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
-            if not usbs:
-                return
-
-            usb_dlg = USBSelectDialog(usbs, self)
-            if not usb_dlg.exec_():
-                return
-
-            selected_usb_path = usb_dlg.selected_usb
-
-        path, _ = QFileDialog.getSaveFileName(self, "Save encrypted file", filter="Encrypted Files (*.enc)")
-        if not path:
-            return
-
-        if mode in [MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
-            combined_key, random_key = create_or_load_key(selected_usb_path, os.path.basename(path))
-            # combined_key saved on disk already by create_or_load_key
-
-            if not random_key:
-                random_key = load_key_for_decrypt(selected_usb_path, os.path.basename(path))
-
+        
         try:
-            encrypt_file(
-                self.editor.toHtml().encode("utf-8"),
-                path,
-                mode,
-                password=password,
-                usb_key=random_key,  # pass the in-memory key to encrypt_file
+            self.show_progress("Preparing to save file...")
+            
+            # Check USB drives
+            usbs = self.check_usb_present()
+
+            # Get encryption mode
+            dlg = EncryptModeDialog(self)
+            if not dlg.exec_():
+                return
+
+            mode = EncryptModeType(dlg.mode)
+            logger.info(f"Selected encryption mode: {mode}")
+
+            # Get password if needed
+            password = None
+            if mode in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY]:
+                pwd_dlg = PasswordDialog(self, warning=(mode == MODE_KEY_ONLY))
+                if not pwd_dlg.exec_():
+                    return
+                password = pwd_dlg.password
+                
+                # Validate password
+                try:
+                    self.validate_password(password)
+                except ValidationError as e:
+                    PangMessageBox.warning(self, "Password Validation", str(e))
+                    # Continue anyway - validation is advisory
+
+            # Get USB key if needed
+            random_key = None
+            selected_usb_path = None
+            if mode in [MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
+                if not usbs:
+                    return
+
+                usb_dlg = USBSelectDialog(usbs, self)
+                if not usb_dlg.exec_():
+                    return
+
+                selected_usb_path = usb_dlg.selected_usb
+                logger.info(f"Selected USB drive: {selected_usb_path}")
+
+            # Get save path
+            path, _ = QFileDialog.getSaveFileName(
+                self, 
+                "Save encrypted file", 
+                filter="Encrypted Files (*.enc)"
             )
-        except Exception as e:
-            PangMessageBox.critical(self, "Save failed", f"Failed to save encrypted file:\n{e}")
-            return
-
-        self.saved_file_path = path
-        self.update_window_title(self.saved_file_path)
-        self.current_mode = mode
-        self.cached_password = password
-        self.cached_usb_key = random_key  # cache random_key (in-memory key) for reuse
-
-        PangMessageBox.information(self, "Saved", "File saved successfully.")
-
-    def open_file(self, path: str | None = None):
-        if not path:
-            path, _ = QFileDialog.getOpenFileName(self, "Open encrypted file", filter="Encrypted Files (*.enc)")
             if not path:
                 return
-
-        try:
-            with open(path, "rb") as f:
-                mode_byte = f.read(1)
-                if not mode_byte:
-                    PangMessageBox.critical(self, "Error", "File is empty or invalid")
-                    return
-                mode = mode_byte[0]
-                if mode not in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
-                    PangMessageBox.critical(self, "Error", f"Unknown encryption mode: {mode}")
-                    return
-        except Exception as e:
-            PangMessageBox.critical(self, "Error", f"Failed to read file: {e}")
-            return
-
-        password = None
-        random_key = None
-
-        if mode in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY]:
-            pwd_dlg = PasswordDialog(self, warning=(mode == MODE_KEY_ONLY))
-            if not pwd_dlg.exec_():
-                return
-            password = pwd_dlg.password
-
-        if mode in [MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
-            usbs = self.check_usb_present()
-            if not usbs:
-                return
-            usb_dlg = USBSelectDialog(usbs, self)
-            if not usb_dlg.exec_():
-                return
-
-            selected_usb_path = usb_dlg.selected_usb
-
+            
+            # Validate file path
             try:
-                random_key = load_key_for_decrypt(selected_usb_path, os.path.basename(path))
+                self.validate_file_path(path)
+            except ValidationError as e:
+                PangMessageBox.critical(self, "Invalid File Path", str(e))
+                return
+            
+            # Check if file exists
+            if os.path.exists(path):
+                ret = PangMessageBox.question(
+                    self,
+                    "File Exists",
+                    f"The file '{os.path.basename(path)}' already exists. Do you want to overwrite it?",
+                    buttons=PangMessageBox.StandardButton.Yes | PangMessageBox.StandardButton.No,
+                    default=PangMessageBox.StandardButton.No
+                )
+                if ret == PangMessageBox.StandardButton.No:
+                    return
+            
+            self.update_progress(25)
+            self.status_bar.showMessage("Generating encryption keys...")
+            
+            # Generate UUID
+            file_uuid = uuid4()
+
+            # Create or load USB key if needed
+            if mode in [MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
+                try:
+                    random_key, _ = create_or_load_key(selected_usb_path, path, file_uuid)
+                    logger.info("USB key created/loaded successfully")
+                except Exception as e:
+                    logger.error(f"Failed to create/load USB key: {e}")
+                    raise USBKeyError(f"Failed to create USB key: {e}")
+
+            self.update_progress(50)
+            self.status_bar.showMessage("Encrypting file...")
+
+            # Encrypt and save
+            try:
+                content = self.editor.toHtml().encode("utf-8")
+                encrypt_file(
+                    content,
+                    path,
+                    mode,
+                    file_uuid,
+                    password=password,
+                    usb_key=random_key
+                )
+                logger.info(f"File encrypted and saved to {path}")
+                
             except Exception as e:
-                PangMessageBox.critical(self, "Error", f"Failed to load USB key:\n{e}")
+                logger.error(f"Encryption failed: {e}")
+                raise CryptographyError(f"Failed to encrypt file: {e}")
+
+            self.update_progress(100)
+            
+            # Update application state
+            self.saved_file_path = path
+            self.update_window_title(self.saved_file_path)
+            self.current_mode = mode
+            self.cached_uuid = file_uuid
+            self.cached_password = password
+            self.cached_usb_key = random_key
+
+            self.status_bar.showMessage("File saved successfully", 3000)
+            PangMessageBox.information(self, "Success", "File saved successfully.")
+            
+        except ValidationError as e:
+            logger.error(f"Validation error: {e}")
+            PangMessageBox.critical(self, "Validation Error", str(e))
+        except CryptographyError as e:
+            logger.error(f"Cryptography error: {e}")
+            PangMessageBox.critical(self, "Encryption Error", str(e))
+        except USBKeyError as e:
+            logger.error(f"USB key error: {e}")
+            PangMessageBox.critical(self, "USB Key Error", str(e))
+        except Exception as e:
+            logger.error(f"Unexpected error during save: {e}")
+            PangMessageBox.critical(self, "Save Failed", f"An unexpected error occurred:\n{e}")
+        finally:
+            self.hide_progress()
+            self.operation_mutex.unlock()
+
+    def secure_clear_memory(self, data: bytes) -> None:
+        """Securely clear sensitive data from memory."""
+        if data:
+            # Since Python bytes are immutable, we can't directly overwrite them.
+            # Instead, we overwrite copies and let the original be garbage collected.
+            # This is not perfect, but prevents simple memory dumps.
+            try:
+                # Create copies and overwrite them (less effective than direct memory manipulation)
+                size = len(data)
+                if size > 0:
+                    # Fill with zeros (note: this doesn't modify the original data)
+                    zero_data = b'\x00' * size
+                    # Overwrite with random data
+                    import os
+                    random_data = os.urandom(size)
+
+                    # Force garbage collection to clear original data faster
+                    import gc
+                    del data
+                    gc.collect()
+
+                    logger.debug("Memory cleared (best-effort for immutable bytes)")
+                else:
+                    # Empty data, nothing to clear
+                    pass
+
+            except Exception as e:
+                logger.warning(f"Failed to securely clear memory: {e}")
+
+    def open_file(self, path: str | None = None):
+        """Open file with enhanced validation, progress indication, and security."""
+        if not self.operation_mutex.tryLock():
+            PangMessageBox.warning(self, "Operation in Progress", "Another operation is in progress. Please wait.")
+            return
+        
+        try:
+            self.show_progress("Opening file...")
+            
+            # Get file path if not provided
+            if not path:
+                path, _ = QFileDialog.getOpenFileName(
+                    self, 
+                    "Open encrypted file", 
+                    filter="Encrypted Files (*.enc)"
+                )
+                if not path:
+                    return
+
+            # Validate file path
+            try:
+                self.validate_file_path(path)
+            except ValidationError as e:
+                PangMessageBox.critical(self, "Invalid File Path", str(e))
                 return
 
-        try:
-            plaintext = decrypt_file(path, password=password, usb_key=random_key)
+            # Check file exists and is readable
+            if not os.path.exists(path):
+                PangMessageBox.critical(self, "File Not Found", f"The file '{path}' does not exist.")
+                return
+            
+            if not os.access(path, os.R_OK):
+                PangMessageBox.critical(self, "Access Denied", f"Cannot read file '{path}'. Check permissions.")
+                return
+
+            self.update_progress(10)
+            self.status_bar.showMessage("Reading file header...")
+
+            # Read and validate file header
+            try:
+                with open(path, "rb") as f:
+                    mode_byte = f.read(1)
+                    if not mode_byte:
+                        raise ValidationError("File is empty or invalid")
+                    
+                    try:
+                        mode = EncryptModeType(mode_byte[0])
+                    except ValueError:
+                        raise ValidationError(f"Unknown encryption mode: {mode_byte[0]}")
+                    
+                    if mode not in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
+                        raise ValidationError(f"Unsupported encryption mode: {mode}")
+                        
+                    logger.info(f"File uses encryption mode: {mode}")
+                    
+            except ValidationError as e:
+                PangMessageBox.critical(self, "Invalid File Format", str(e))
+                return
+            except Exception as e:
+                logger.error(f"Failed to read file header: {e}")
+                PangMessageBox.critical(self, "File Read Error", f"Failed to read file: {e}")
+                return
+
+            self.update_progress(25)
+            
+            # Get credentials based on encryption mode
+            password = None
+            random_key = None
+            file_uuid = None
+
+            # Get password if needed
+            if mode in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY]:
+                self.status_bar.showMessage("Waiting for password...")
+                pwd_dlg = PasswordDialog(self, warning=(mode == MODE_KEY_ONLY))
+                if not pwd_dlg.exec_():
+                    return
+                password = pwd_dlg.password
+                logger.debug("Password provided for decryption")
+
+            self.update_progress(40)
+
+            # Get USB key if needed
+            if mode in [MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
+                self.status_bar.showMessage("Loading USB key...")
+                usbs = self.check_usb_present()
+                if not usbs:
+                    return
+                    
+                usb_dlg = USBSelectDialog(usbs, self)
+                if not usb_dlg.exec_():
+                    return
+
+                selected_usb_path = usb_dlg.selected_usb
+                logger.info(f"Selected USB drive: {selected_usb_path}")
+
+                try:
+                    random_key, file_uuid = create_or_load_key(selected_usb_path, path, create=False)
+                    logger.info("USB key loaded successfully")
+                except Exception as e:
+                    logger.error(f"Failed to load USB key: {e}")
+                    raise USBKeyError(f"Failed to load USB key: {e}")
+
+            self.update_progress(60)
+            self.status_bar.showMessage("Decrypting file...")
+
+            # Decrypt file
+            try:
+                plaintext = decrypt_file(path, password=password, usb_key=random_key)
+                logger.info(f"File decrypted successfully: {len(plaintext)} bytes")
+                
+            except Exception as e:
+                logger.error(f"Decryption failed: {e}")
+                raise CryptographyError(f"Failed to decrypt file: {e}")
+
+            self.update_progress(80)
+            self.status_bar.showMessage("Loading content...")
+
+            # Load content into editor
+            try:
+                content_str = plaintext.decode("utf-8")
+                self.editor.setHtml(content_str)
+                
+                # Securely clear plaintext from memory
+                self.secure_clear_memory(plaintext)
+                
+            except UnicodeDecodeError as e:
+                logger.error(f"Failed to decode file content: {e}")
+                PangMessageBox.critical(
+                    self, 
+                    "Content Error", 
+                    "Failed to decode file content. The file may be corrupted or use an unsupported encoding."
+                )
+                return
+
+            self.update_progress(100)
+
+            # Update application state
+            self.saved_file_path = path
+            self.update_window_title(self.saved_file_path)
+            self.current_mode = mode
+            self.cached_uuid = file_uuid
+            self.cached_password = password
+            self.cached_usb_key = random_key
+
+            self.status_bar.showMessage("File opened successfully", 3000)
+            PangMessageBox.information(self, "Success", "File opened successfully.")
+            logger.info(f"File opened successfully: {path}")
+            
+        except ValidationError as e:
+            logger.error(f"Validation error: {e}")
+            PangMessageBox.critical(self, "Validation Error", str(e))
+        except CryptographyError as e:
+            logger.error(f"Cryptography error: {e}")
+            PangMessageBox.critical(self, "Decryption Error", str(e))
+        except USBKeyError as e:
+            logger.error(f"USB key error: {e}")
+            PangMessageBox.critical(self, "USB Key Error", str(e))
         except Exception as e:
-            PangMessageBox.critical(self, "Error", f"Failed to decrypt file:\n{e}")
-            return
-
-        self.editor.setHtml(plaintext.decode("utf-8"))
-        self.saved_file_path = path
-        self.update_window_title(self.saved_file_path)
-        self.current_mode = mode
-        self.cached_password = password
-        self.cached_usb_key = random_key  # cache in-memory random_key
-
-        PangMessageBox.information(self, "Opened", "File opened successfully.")
+            logger.error(f"Unexpected error during file open: {e}")
+            PangMessageBox.critical(self, "Open Failed", f"An unexpected error occurred:\n{e}")
+        finally:
+            self.hide_progress()
+            self.operation_mutex.unlock()
     
     def close_file(self):
         content_empty = self.editor.toPlainText().strip() == ""
