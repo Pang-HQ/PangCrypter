@@ -44,7 +44,7 @@ import zipfile
 import os
 
 dist_dir = "dist"
-zip_name = "pangcrypter.zip"
+zip_name = "PangCrypter.zip"
 pangcrypter_folder = "PangCrypter"
 
 if os.path.exists(dist_dir):
@@ -72,4 +72,4 @@ if os.path.exists(dist_dir):
     print(f"\n✅ ZIP distribution created: {os.path.join(dist_dir, zip_name)}")
     print(f"   Contents: {pangcrypter_folder}/PangCrypter.exe, {pangcrypter_folder}/ui/, {pangcrypter_folder}/version.txt")
 
-print("\n✅ Build complete! Check the 'dist' folder for PangCrypter.exe and pangcrypter.zip")
+print("\n✅ Build complete! Check the 'dist' folder for PangCrypter.exe and PangCrypter.zip")
