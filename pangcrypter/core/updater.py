@@ -11,6 +11,8 @@ import requests
 import tempfile
 import subprocess
 import time
+import zipfile
+import shutil
 from typing import Optional, Tuple, Dict, Any
 from packaging import version
 import hashlib
@@ -102,11 +104,12 @@ class AutoUpdater:
                 # Fallback to string comparison
                 update_available = latest_version != self.current_version
 
-            # Find the Windows exe asset
+            # Find the Windows exe asset or ZIP file
             download_url = None
             for asset in release_data.get('assets', []):
                 asset_name = asset.get('name', '').lower()
-                if asset_name.endswith('.exe') and ('pangcrypter' in asset_name or 'pang' in asset_name):
+                # Look for exe files or zip files containing pangcrypter
+                if (asset_name.endswith('.exe') or asset_name.endswith('.zip')) and ('pangcrypter' in asset_name or 'pang' in asset_name):
                     download_url = asset.get('browser_download_url')
                     break
 
@@ -194,12 +197,30 @@ class AutoUpdater:
                     logger.warning(f"File size mismatch: expected {expected_size}, got {actual_size}")
                     return False
 
-            # Basic executable check (Windows PE header)
-            with open(file_path, 'rb') as f:
-                header = f.read(2)
-                if header != b'MZ':  # Windows executable magic number
-                    logger.warning("Downloaded file is not a valid Windows executable")
+            # Check file type based on extension
+            if file_path.lower().endswith('.zip'):
+                # Verify ZIP file integrity
+                try:
+                    with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                        # Test the ZIP file
+                        bad_file = zip_ref.testzip()
+                        if bad_file:
+                            logger.warning(f"ZIP file corrupted, bad file: {bad_file}")
+                            return False
+                        logger.info("ZIP file integrity verified")
+                except zipfile.BadZipFile:
+                    logger.warning("Downloaded file is not a valid ZIP file")
                     return False
+            elif file_path.lower().endswith('.exe'):
+                # Basic executable check (Windows PE header)
+                with open(file_path, 'rb') as f:
+                    header = f.read(2)
+                    if header != b'MZ':  # Windows executable magic number
+                        logger.warning("Downloaded file is not a valid Windows executable")
+                        return False
+            else:
+                logger.warning(f"Unsupported file type: {file_path}")
+                return False
 
             return True
 
@@ -209,74 +230,121 @@ class AutoUpdater:
 
     def install_update(self, update_file_path: str) -> bool:
         """
-        Install the update by replacing the current executable.
+        Install the update by replacing the current installation.
 
         Args:
-            update_file_path: Path to the update file
+            update_file_path: Path to the update file (EXE or ZIP)
 
         Returns:
             True if installation successful
         """
         try:
-            # Get current executable path
-            current_exe = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
+            # Get current installation directory
+            if getattr(sys, 'frozen', False):
+                # Running as PyInstaller bundle
+                current_dir = os.path.dirname(sys.executable)
+            else:
+                # Running in development
+                current_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
-            # For PyInstaller bundles, the executable is the main script
-            if not getattr(sys, 'frozen', False):
-                # In development, find the built executable
-                dist_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dist")
-                exe_path = os.path.join(dist_dir, "PangCrypter.exe")
-                if os.path.exists(exe_path):
-                    current_exe = exe_path
-                else:
-                    raise UpdaterError("No built executable found for update")
-
-            logger.info(f"Current executable: {current_exe}")
+            logger.info(f"Current installation directory: {current_dir}")
             logger.info(f"Update file: {update_file_path}")
 
-            # Create backup of current executable
-            backup_path = current_exe + ".backup"
+            # Create backup directory
+            backup_dir = os.path.join(current_dir, "backup")
             try:
-                if os.path.exists(backup_path):
-                    os.remove(backup_path)
-                os.rename(current_exe, backup_path)
-                logger.info(f"Created backup: {backup_path}")
+                if os.path.exists(backup_dir):
+                    shutil.rmtree(backup_dir)
+                shutil.copytree(current_dir, backup_dir, ignore=shutil.ignore_patterns("backup"))
+                logger.info(f"Created backup: {backup_dir}")
             except Exception as e:
                 logger.warning(f"Failed to create backup: {e}")
 
-            # Replace executable
-            try:
-                # On Windows, we need to be careful about file locking
-                # The current process might be locking the file
-                if os.name == 'nt':  # Windows
-                    # Try to move the update file to replace the current exe
-                    os.rename(update_file_path, current_exe)
-                else:
-                    # For other platforms (though this is Windows-specific)
-                    with open(update_file_path, 'rb') as src, open(current_exe, 'wb') as dst:
-                        dst.write(src.read())
+            # Check if update file is a ZIP
+            if update_file_path.lower().endswith('.zip'):
+                # Extract ZIP file
+                extract_dir = os.path.join(self.temp_dir, f"pangcrypter_extract_{int(time.time())}")
+                os.makedirs(extract_dir, exist_ok=True)
 
-                logger.info("Update installed successfully")
-
-                # Clean up backup after successful update
-                if os.path.exists(backup_path):
-                    try:
-                        os.remove(backup_path)
-                    except:
-                        pass  # Ignore cleanup errors
-
-                return True
-
-            except Exception as e:
-                # Restore backup if installation failed
                 try:
-                    if os.path.exists(backup_path):
-                        os.rename(backup_path, current_exe)
-                        logger.info("Restored backup after failed installation")
-                except:
-                    pass
+                    with zipfile.ZipFile(update_file_path, 'r') as zip_ref:
+                        zip_ref.extractall(extract_dir)
+                    logger.info(f"Extracted ZIP to: {extract_dir}")
 
-                raise UpdaterError(f"Failed to install update: {e}")
+                    # Find the PangCrypter directory in the extracted files
+                    pangcrypter_dir = None
+                    for item in os.listdir(extract_dir):
+                        item_path = os.path.join(extract_dir, item)
+                        if os.path.isdir(item_path) and 'pangcrypter' in item.lower():
+                            pangcrypter_dir = item_path
+                            break
+
+                    if not pangcrypter_dir:
+                        raise UpdaterError("Could not find PangCrypter directory in ZIP file")
+
+                    logger.info(f"Found PangCrypter directory: {pangcrypter_dir}")
+
+                    # Copy files from extracted directory to current directory
+                    for item in os.listdir(pangcrypter_dir):
+                        src_path = os.path.join(pangcrypter_dir, item)
+                        dst_path = os.path.join(current_dir, item)
+
+                        if os.path.isdir(src_path):
+                            # Copy directory
+                            if os.path.exists(dst_path):
+                                shutil.rmtree(dst_path)
+                            shutil.copytree(src_path, dst_path)
+                        else:
+                            # Copy file
+                            shutil.copy2(src_path, dst_path)
+
+                    logger.info("Update files copied successfully")
+
+                except Exception as e:
+                    logger.error(f"Failed to extract and copy ZIP contents: {e}")
+                    raise UpdaterError(f"Failed to install update from ZIP: {e}")
+                finally:
+                    # Clean up extraction directory
+                    try:
+                        shutil.rmtree(extract_dir)
+                    except:
+                        pass
+
+            else:
+                # Handle EXE file replacement (legacy support)
+                current_exe = os.path.join(current_dir, "PangCrypter.exe")
+                if not os.path.exists(current_exe):
+                    raise UpdaterError("Current executable not found")
+
+                try:
+                    # Create backup of current exe
+                    backup_exe = current_exe + ".backup"
+                    if os.path.exists(backup_exe):
+                        os.remove(backup_exe)
+                    os.rename(current_exe, backup_exe)
+
+                    # Replace with new exe
+                    os.rename(update_file_path, current_exe)
+                    logger.info("EXE update installed successfully")
+
+                except Exception as e:
+                    # Restore backup if installation failed
+                    try:
+                        if os.path.exists(backup_exe):
+                            os.rename(backup_exe, current_exe)
+                    except:
+                        pass
+                    raise UpdaterError(f"Failed to install EXE update: {e}")
+
+            # Clean up backup after successful update
+            if os.path.exists(backup_dir):
+                try:
+                    shutil.rmtree(backup_dir)
+                except:
+                    pass  # Ignore cleanup errors
+
+            logger.info("Update installed successfully")
+            return True
 
         except Exception as e:
             logger.error(f"Installation failed: {e}")
@@ -365,7 +433,7 @@ class AutoUpdater:
             try:
                 # Remove any leftover temp files (this is a best-effort cleanup)
                 for filename in os.listdir(self.temp_dir):
-                    if filename.startswith("pangcrypter_update_") and filename.endswith(".exe"):
+                    if filename.startswith("pangcrypter_update_") and (filename.endswith(".exe") or filename.endswith(".zip")):
                         filepath = os.path.join(self.temp_dir, filename)
                         try:
                             os.remove(filepath)
