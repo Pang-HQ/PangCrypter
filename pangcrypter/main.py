@@ -23,12 +23,16 @@ from .ui.update_dialog import UpdateDialog
 
 from uuid import uuid4
 
-# Configure logging
+# Configure logging to user-writable location
+log_dir = os.path.join(os.path.expanduser("~"), ".pangcrypter")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "pangcrypter.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('pangcrypter.log'),
+        logging.FileHandler(log_file),
         logging.StreamHandler()
     ]
 )
