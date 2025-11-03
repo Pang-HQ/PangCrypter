@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QPushButton, QHBoxLayout
 )
 
-from styles import DARK_BG, DARKER_BG, PURPLE, PURPLE_HOVER, TEXT_COLOR, BUTTON_TEXT, WARNING_COLOR
+from .styles import DARK_BG, DARKER_BG, PURPLE, PURPLE_HOVER, TEXT_COLOR, BUTTON_TEXT, WARNING_COLOR
 from PyQt6.QtCore import Qt
 
 PREFERENCES_FILE = "preferences.json"
@@ -97,14 +97,14 @@ class PreferencesDialog(QDialog):
                 height: 16px;
                 border: none;
                 margin-right: 10px;
-                image: url(./dropup.svg);
+                image: url(ui/dropup.svg);
             }}
             QSpinBox::down-button {{
                 width: 12px;
                 height: 16px;
                 border: none;
                 margin-right: 10px;
-                image: url(./dropdown.svg);
+                image: url(ui/dropdown.svg);
             }}
         """
 
@@ -126,7 +126,7 @@ class PreferencesDialog(QDialog):
                 subcontrol-position: top right;
             }}
             QComboBox::down-arrow {{
-                image: url(./dropdown.svg);
+                image: url(ui/dropdown.svg);
                 width: 12px;
                 height: 16px;
                 margin-right: 10px;

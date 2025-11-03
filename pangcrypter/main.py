@@ -10,15 +10,16 @@ from typing import Optional, List
 from PyQt6.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QProgressBar, QStatusBar
 from PyQt6.QtCore import QTimer, Qt, QEvent, QObject, pyqtSignal, QThread, QMutex
 from PyQt6.QtGui import QIcon, QAction
-from main_ui import (
+from .ui.main_ui import (
     EditorWidget, EncryptModeDialog, PasswordDialog, USBSelectDialog
 )
-from lib.encrypt import encrypt_file, decrypt_file, EncryptModeType
-from lib.key import create_or_load_key
-from messagebox import PangMessageBox
+from .core.encrypt import encrypt_file, decrypt_file, EncryptModeType
+from .core.key import create_or_load_key
+from .ui.messagebox import PangMessageBox
 
-from preferences import PreferencesDialog, PangPreferences
-from styles import TEXT_COLOR, DARKER_BG, PURPLE
+from .utils.preferences import PreferencesDialog, PangPreferences
+from .utils.styles import TEXT_COLOR, DARKER_BG, PURPLE
+from .ui.update_dialog import UpdateDialog
 
 from uuid import uuid4
 
@@ -163,7 +164,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PangCrypter Editor")
-        self.setWindowIcon(QIcon("logo.ico"))
+        self.setWindowIcon(QIcon("ui/logo.ico"))
         self.resize(800, 600)
 
         self.editor = EditorWidget()
@@ -217,6 +218,7 @@ class MainWindow(QMainWindow):
 
         help_menu = self.menuBar().addMenu("&Help")
         help_menu.addAction("&Help", self.open_help_page).setShortcut("F1")
+        help_menu.addAction("&Check for Updates", self.open_update_dialog)
 
         # Style
         self.setStyleSheet(f"""
@@ -277,6 +279,15 @@ class MainWindow(QMainWindow):
     
     def open_help_page(self):
         webopen("https://www.panghq.com/tools/pangcrypter/help")
+
+    def open_update_dialog(self):
+        """Open the update dialog."""
+        try:
+            dialog = UpdateDialog(self)
+            dialog.exec()
+        except Exception as e:
+            logger.error(f"Failed to open update dialog: {e}")
+            PangMessageBox.critical(self, "Update Error", f"Failed to open update dialog:\n{e}")
     
     def on_save_triggered(self):
         if self.saved_file_path is None:

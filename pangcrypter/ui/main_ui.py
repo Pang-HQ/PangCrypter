@@ -3,8 +3,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QTextCursor, QKeyEvent, QTextCharFormat, QFont
 from PyQt6.QtCore import pyqtSignal, Qt
-from preferences import PangPreferences
-from styles import (
+from ..utils.preferences import PangPreferences
+from ..utils.styles import (
     DARK_BG, DARKER_BG, PURPLE, PURPLE_HOVER, TEXT_COLOR, DISABLED_TEXT_COLOR,
     BUTTON_TEXT, WARNING_COLOR, EDITOR_FONT_SIZE_PX, EDITOR_FONT_SIZE_PT
 )

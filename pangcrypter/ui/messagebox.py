@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import QMessageBox
-from styles import *
+from ..utils.styles import *
 
 class PangMessageBox(QMessageBox):
     def __init__(self, *args, **kwargs):
@@ -67,4 +67,3 @@ class PangMessageBox(QMessageBox):
         box.setStandardButtons(buttons)
         box.setDefaultButton(default)
         return box.exec()
-

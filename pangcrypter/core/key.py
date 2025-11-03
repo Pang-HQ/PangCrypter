@@ -1,7 +1,7 @@
 import os, hashlib, platform, plistlib
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from lib.encrypt import EncryptModeType, SALT_SIZE, UUID_SIZE
+from .encrypt import EncryptModeType, SALT_SIZE, UUID_SIZE
 from uuid import UUID
 from typing import Optional
 
