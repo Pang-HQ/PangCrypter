@@ -39,4 +39,37 @@ PyInstaller.__main__.run([
     "--hidden-import", "pangcrypter.utils",
 ])
 
-print("\n✅ Build complete! Check the 'dist' folder for PangCrypter.exe")
+# Create ZIP distribution with proper folder structure
+import zipfile
+import os
+
+dist_dir = "dist"
+zip_name = "pangcrypter.zip"
+pangcrypter_folder = "PangCrypter"
+
+if os.path.exists(dist_dir):
+    with zipfile.ZipFile(os.path.join(dist_dir, zip_name), 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Add the executable
+        exe_path = os.path.join(dist_dir, "PangCrypter.exe")
+        if os.path.exists(exe_path):
+            zipf.write(exe_path, os.path.join(pangcrypter_folder, "PangCrypter.exe"))
+
+        # Add the ui folder contents
+        ui_src = os.path.join(project_root, "ui")
+        if os.path.exists(ui_src):
+            for root, dirs, files in os.walk(ui_src):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    # Add to ui/ subfolder in ZIP
+                    arcname = os.path.join(pangcrypter_folder, "ui", os.path.relpath(file_path, ui_src))
+                    zipf.write(file_path, arcname)
+
+        # Add version.txt
+        version_src = os.path.join(project_root, "version.txt")
+        if os.path.exists(version_src):
+            zipf.write(version_src, os.path.join(pangcrypter_folder, "version.txt"))
+
+    print(f"\n✅ ZIP distribution created: {os.path.join(dist_dir, zip_name)}")
+    print(f"   Contents: {pangcrypter_folder}/PangCrypter.exe, {pangcrypter_folder}/ui/, {pangcrypter_folder}/version.txt")
+
+print("\n✅ Build complete! Check the 'dist' folder for PangCrypter.exe and pangcrypter.zip")
