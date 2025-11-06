@@ -7,6 +7,8 @@ from typing import Optional
 
 KEY_SIZE = 32
 KEY_FOLDER = ".pangcrypt_keys"
+SECRET_FILE = f"{KEY_FOLDER}/secret.bin"
+KEY_VERSION = 0x01
 
 
 def get_file_id(path: str) -> str:
@@ -45,30 +47,68 @@ def get_file_id(path: str) -> str:
     return uuid_bytes.hex()
 
 
-def encrypt_random_key_with_hwid(random_key: bytes, hardware_id: bytes) -> bytes:
+def get_or_create_drive_secret(drive_root: str) -> bytes:
     """
-    Encrypt the random_key with a key derived from hardware_id.
-    Returns combined_key (encrypted random_key + nonce).
+    Load or generate a per-drive secret stored in .pangcrypt_keys/secret.bin.
+    This secret is used alongside the HWID to encrypt keys.
     """
-    # Derive AES key from hardware_id using HKDF (or just hash)
-    aes_key = hashlib.sha256(hardware_id).digest()  # 32 bytes
+    folder = os.path.join(drive_root, KEY_FOLDER)
+    os.makedirs(folder, exist_ok=True)
+    secret_path = os.path.join(folder, "secret.bin")
 
-    # AESGCM requires 12-byte nonce
+    if os.path.exists(secret_path):
+        with open(secret_path, "rb") as f:
+            secret = f.read()
+        if len(secret) != KEY_SIZE:
+            raise ValueError("Invalid drive secret size")
+    else:
+        secret = os.urandom(KEY_SIZE)
+        with open(secret_path, "wb") as f:
+            f.write(secret)
+        
+        if os.name == "nt":
+            try:
+                import ctypes
+                FILE_ATTRIBUTE_HIDDEN = 0x02
+                attrs = ctypes.windll.kernel32.GetFileAttributesW(folder)
+                if attrs != -1 and not (attrs & FILE_ATTRIBUTE_HIDDEN):
+                    ctypes.windll.kernel32.SetFileAttributesW(folder, attrs | FILE_ATTRIBUTE_HIDDEN)
+            except Exception as e:
+                print(f"Warning: Could not hide folder {folder}: {e}")
+
+    return secret
+
+def encrypt_random_key(random_key: bytes, hardware_id: bytes, drive_secret: bytes) -> bytes:
+    """
+    Encrypt the random_key with AESGCM using HWID + drive secret, including version byte.
+    """
+
+    aes_key = hashlib.sha256(hardware_id + drive_secret).digest()  # 32 bytes
     nonce = os.urandom(12)
     aesgcm = AESGCM(aes_key)
-    encrypted = aesgcm.encrypt(nonce, random_key, None)
 
-    # Store nonce + ciphertext
-    return nonce + encrypted
+    ciphertext = aesgcm.encrypt(nonce, random_key, None)
+    
+    return bytes([KEY_VERSION]) + nonce + ciphertext
 
-def decrypt_random_key_with_hwid(combined_key: bytes, hardware_id: bytes) -> bytes:
+
+def decrypt_random_key(combined_key: bytes, hardware_id: bytes, drive_secret: bytes) -> bytes:
     """
-    Decrypt the combined_key to retrieve the original random_key.
+    Decrypt the random_key using AESGCM with HWID + drive secret, handling version.
     """
-    aes_key = hashlib.sha256(hardware_id).digest()
-    nonce = combined_key[:12]
-    ciphertext = combined_key[12:]
+    if len(combined_key) < 1 + 12 + KEY_SIZE:
+        raise ValueError("Key file too short or corrupted")
+    
+    version = combined_key[0]
+
+    if version != KEY_VERSION:
+        raise ValueError(f"Unsupported key version: {version}")
+
+    nonce = combined_key[1:13]
+    ciphertext = combined_key[13:]
+    aes_key = hashlib.sha256(hardware_id + drive_secret).digest()
     aesgcm = AESGCM(aes_key)
+
     return aesgcm.decrypt(nonce, ciphertext, None)
 
 
@@ -80,7 +120,7 @@ def get_drive_hardware_id(drive_path: str) -> bytes:
     Improvements:
     - Windows: prefer WMI volume serial via 'wmic' or PowerShell.
     - macOS: parse diskutil plist output.
-    - Linux: use blkid, fallback to hashing drive_path.
+    - Linux: use blkid.
     """
     system = platform.system()
     if system == "Windows":
@@ -98,20 +138,8 @@ def get_drive_hardware_id(drive_path: str) -> bytes:
                     if serial:
                         serial_bytes = bytes.fromhex(serial)
                         return hashlib.sha256(serial_bytes).digest()
-        except Exception:
-            pass
-
-        # Fallback to vol command as before
-        try:
-            drive_letter = drive_path.rstrip("\\/")[:2]
-            result = subprocess.run(["vol", drive_letter], capture_output=True, text=True, check=True)
-            for line in result.stdout.splitlines():
-                if "Serial Number is" in line:
-                    serial_str = line.strip().split()[-1]
-                    serial_bytes = bytes.fromhex(serial_str.replace("-", ""))
-                    return hashlib.sha256(serial_bytes).digest()
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(f"Failed to get hardware ID for {drive_path} on Windows: {e}")
 
     elif system == "Linux":
         try:
@@ -119,8 +147,8 @@ def get_drive_hardware_id(drive_path: str) -> bytes:
             uuid_str = result.stdout.strip()
             if uuid_str:
                 return hashlib.sha256(uuid_str.encode('utf-8')).digest()
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(f"Failed to get hardware ID for {drive_path} on Linux: {e}")
 
     elif system == "Darwin":
         # Use diskutil info -plist <drive> and parse plist for VolumeUUID
@@ -130,11 +158,10 @@ def get_drive_hardware_id(drive_path: str) -> bytes:
             volume_uuid = plist.get("VolumeUUID", None)
             if volume_uuid:
                 return hashlib.sha256(volume_uuid.encode('utf-8')).digest()
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(f"Failed to get hardware ID for {drive_path} on macOS: {e}")
 
-    # Fallback: hash drive path string (less secure)
-    return hashlib.sha256(drive_path.encode("utf-8")).digest()
+    raise RuntimeError(f"Unsupported system or could not get hardware ID for drive {drive_path}")
 
 
 def get_drive_root_path(drive_name: str) -> str:
@@ -173,7 +200,6 @@ def get_key_path(drive_root: str, path: str, uuid: UUID) -> str:
 def create_or_load_key(drive_name: str, path: str, uuid: Optional[UUID] = None, create: bool = True) -> tuple[bytes, UUID]:
     drive_root = get_drive_root_path(drive_name)
     
-    # If UUID not provided, derive it from the file
     file_uuid = uuid
     if not file_uuid:
         try:
@@ -181,23 +207,22 @@ def create_or_load_key(drive_name: str, path: str, uuid: Optional[UUID] = None, 
             file_uuid = UUID(file_id_hex)
         except Exception:
             if not create:
-                raise ValueError(f"Could not derive UUID from {path}. Ensure it is a valid encrypted file.")
+                raise ValueError(f"Could not derive UUID from {path}. Ensure it is in a valid format.")
     
     if not file_uuid:
         raise ValueError("No UUID provided and could not derive from file.")
     
     key_path = get_key_path(drive_root, path, file_uuid)
     hardware_id = get_drive_hardware_id(drive_root)
+    drive_secret = get_or_create_drive_secret(drive_root)
 
     if os.path.exists(key_path):
-        # Load combined key (encrypted random_key)
         with open(key_path, "rb") as f:
             combined_key = f.read()
-        random_key = decrypt_random_key_with_hwid(combined_key, hardware_id)
+        random_key = decrypt_random_key(combined_key, hardware_id, drive_secret)
     elif create:
-        # Generate new random key
         random_key = generate_secure_key()
-        combined_key = encrypt_random_key_with_hwid(random_key, hardware_id)
+        combined_key = encrypt_random_key(random_key, hardware_id, drive_secret)
         with open(key_path, "wb") as f:
             f.write(combined_key)
     else:
