@@ -1,156 +1,54 @@
 import sys
-import psutil
 import os
-import platform
-import subprocess
 import logging
-from time import sleep
+import argparse
+import json
+from datetime import datetime, timezone
+from time import monotonic
 from webbrowser import open as webopen
 from typing import Optional, List
-from PyQt6.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QProgressBar, QStatusBar
-from PyQt6.QtCore import QTimer, Qt, QEvent, QObject, pyqtSignal, QThread, QMutex
-from PyQt6.QtGui import QIcon, QAction
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QFileDialog, QLabel, QProgressBar,
+    QStatusBar, QMenu
+)
+from PyQt6.QtCore import QTimer, Qt, QEvent, QThread, QMutex
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import QMessageBox
 from .ui.main_ui import (
     EditorWidget, EncryptModeDialog, PasswordDialog, USBSelectDialog
 )
 from .core.encrypt import encrypt_file, decrypt_file, EncryptModeType
+from .core.format_config import (
+    SETTINGS_SIZE,
+    CONTENT_MODE_OFFSET,
+    CONTENT_MODE_PLAINTEXT,
+    CONTENT_MODE_HTML,
+    HEADER_VERSION,
+    decode_version,
+)
 from .core.key import create_or_load_key
 from .ui.messagebox import PangMessageBox
 
 from .utils.preferences import PreferencesDialog, PangPreferences
 from .utils.styles import TEXT_COLOR, DARKER_BG, PURPLE
 from .ui.update_dialog import UpdateDialog
-
-from uuid import uuid4
-
-# Configure logging to user-writable location
-log_dir = os.path.join(os.path.expanduser("~"), ".pangcrypter")
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, "pangcrypter.log")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler()
-    ]
+from .utils.logger import configure_logging
+from .utils.usb import list_usb_drives
+from .utils.screen_recording import ScreenRecordingChecker
+from .utils.mem_guard import (
+    MemGuardChecker,
+    MemGuardMode,
+    MemGuardFinding,
+    is_mem_guard_supported,
 )
+
+from uuid import uuid4, UUID
+
 logger = logging.getLogger(__name__)
 
 MODE_PASSWORD_ONLY = EncryptModeType.MODE_PASSWORD_ONLY
 MODE_PASSWORD_PLUS_KEY = EncryptModeType.MODE_PASSWORD_PLUS_KEY
 MODE_KEY_ONLY = EncryptModeType.MODE_KEY_ONLY
-
-
-# List of known screen recording process names (case insensitive)
-screen_recorders_lower = {
-    "obs64.exe",      # OBS Studio 64-bit on Windows
-    "obs32.exe",      # OBS Studio 32-bit on Windows
-    "obs.exe",        # Generic OBS name
-    "bandicam.exe",   # Bandicam
-    "camtasia.exe",   # Camtasia
-    "xsplit.exe",     # XSplit Broadcaster
-    "ffmpeg.exe",     # ffmpeg (if used for recording)
-    "screenrecorder.exe",
-    "screencast-o-matic.exe",
-    "sharex.exe",
-    # Add other known recorders here if you want
-}
-
-def list_usb_drives():
-    drives = []
-    system = platform.system()
-
-    if system == "Windows":
-        # On Windows, use wmic to get removable drives
-        try:
-            output = subprocess.check_output('wmic logicaldisk where "drivetype=2" get deviceid', shell=True).decode()
-            for line in output.strip().splitlines():
-                line = line.strip()
-                if line and line != "DeviceID":
-                    drive_path = line + "\\"
-                    if os.access(drive_path, os.W_OK):
-                        drives.append(drive_path)
-        except Exception:
-            pass
-
-    elif system == "Linux":
-        # On Linux, check /media and /run/media for mounted removable drives
-        media_paths = ["/media", "/run/media"]
-        for media_root in media_paths:
-            if os.path.exists(media_root):
-                for user_folder in os.listdir(media_root):
-                    user_path = os.path.join(media_root, user_folder)
-                    if os.path.isdir(user_path):
-                        for mount in os.listdir(user_path):
-                            mount_path = os.path.join(user_path, mount)
-                            if os.path.ismount(mount_path) and os.access(mount_path, os.W_OK):
-                                drives.append(mount_path)
-
-    elif system == "Darwin":
-        # macOS: check /Volumes for mounted drives that are writable
-        volumes_path = "/Volumes"
-        if os.path.exists(volumes_path):
-            for volume in os.listdir(volumes_path):
-                vol_path = os.path.join(volumes_path, volume)
-                if os.path.ismount(vol_path) and os.access(vol_path, os.W_OK):
-                    drives.append(vol_path)
-    else:
-        PangMessageBox.warning(None, "Unsupported OS", "This script only supports Windows, Linux, and macOS.")
-
-    return drives
-
-class ScreenRecordingChecker(QObject):
-    screen_recording_changed = pyqtSignal(bool)
-
-    def __init__(self, check_interval=1):
-        super().__init__()
-        self.check_interval = check_interval
-        self.running = True
-        self._last_status = False
-        self.cached_procs = set()
-
-    def stop(self):
-        self.running = False
-
-    def run(self):
-        while self.running:
-            try:
-                current_procs = set()
-                # Gather current running process names, lowercase for matching
-                for proc in psutil.process_iter(["name"]):
-                    try:
-                        pname = proc.info["name"]
-                        if pname:
-                            current_procs.add(pname.lower())
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                        continue
-
-                new_procs = current_procs - self.cached_procs
-                self.cached_procs = current_procs
-
-                # Only check new processes to reduce overhead
-                recording_detected = False
-                for pname in new_procs:
-                    if pname in screen_recorders_lower:
-                        recording_detected = True
-                        break
-
-                # Also if last status was True but process disappeared, update status
-                if self._last_status and not recording_detected:
-                    # Need to check if any screen recorder is still running
-                    recording_detected = any(proc in screen_recorders_lower for proc in current_procs)
-
-                if recording_detected != self._last_status:
-                    self._last_status = recording_detected
-                    self.screen_recording_changed.emit(recording_detected)
-
-            except Exception as e:
-                # Optionally log the error
-                pass
-
-            sleep(self.check_interval)
 
 class ValidationError(Exception):
     """Custom exception for input validation errors."""
@@ -165,6 +63,9 @@ class USBKeyError(Exception):
     pass
 
 class MainWindow(QMainWindow):
+    MAX_SECRET_CACHE_IDLE_MINUTES = 15
+    DEFAULT_SECRET_CACHE_IDLE_MINUTES = 5
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PangCrypter Editor")
@@ -177,9 +78,20 @@ class MainWindow(QMainWindow):
 
         self.saved_file_path = None
         self.current_mode = None
-        self.cached_password = None
-        self.cached_usb_key = None
+        self.current_content_mode = CONTENT_MODE_PLAINTEXT
+        self.cached_password = None  # obfuscated bytearray
+        self.cached_usb_key = None   # obfuscated bytearray
         self.cached_uuid = None
+        self.header_version = HEADER_VERSION
+        self._secret_mask = os.urandom(32)
+        self._panic_recovery_path: Optional[str] = None
+        self._mem_guard_handling = False
+        self._pending_mem_guard_findings: list[MemGuardFinding] = []
+        self._pending_mem_guard_keys: set[tuple[int, str, int, str]] = set()
+        self._mem_guard_disabled_until_restart = False
+        self._secret_cache_notice_logged = False
+        self._focus_lost_at: Optional[float] = None
+        self._last_editor_activity_at: float = monotonic()
         
         # Thread safety
         self.operation_mutex = QMutex()
@@ -190,6 +102,16 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.status_bar.addPermanentWidget(self.progress_bar)
+
+        self.mode_label = QLabel("Plaintext mode")
+        self.mode_label.setStyleSheet("color: #8b8b8b; padding-right: 10px;")
+        self.mode_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.mode_label.customContextMenuRequested.connect(self.show_content_mode_menu)
+        self.status_bar.addPermanentWidget(self.mode_label)
+
+        self.file_info_label = QLabel("No file loaded")
+        self.file_info_label.setStyleSheet("color: #8b8b8b; padding-right: 10px;")
+        self.status_bar.addPermanentWidget(self.file_info_label)
         
         # USB drive cache for performance
         self.usb_cache = []
@@ -225,7 +147,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction("&Check for Updates", self.open_update_dialog)
 
         # Style
-        self.setStyleSheet(f"""
+        self.setStyleSheet("""
             QMainWindow {{ background-color: #121212; color: #eee; }}
             QTextEdit {{ background-color: #1e1e1e; color: #ddd; font-family: Consolas, monospace; font-size: 14px; }}
             QMenuBar {{ background-color: #222; color: #eee; }}
@@ -235,6 +157,8 @@ class MainWindow(QMainWindow):
             QPushButton:hover {{ background-color: #555; }}
             QLineEdit, QComboBox {{ background-color: #222; color: #eee; border: 1px solid #555; border-radius: 3px; padding: 3px; }}
         """)
+
+        self.editor.set_content_mode(False)
 
         # Hidden label when editor is hidden
         self.hidden_label = QLabel(
@@ -259,6 +183,12 @@ class MainWindow(QMainWindow):
         self.autosave_timer.setInterval(1000)
         self.autosave_timer.timeout.connect(self.autosave)
         self.editor.textChanged.connect(lambda: self.autosave_timer.start())
+        self.editor.textChanged.connect(self._on_editor_activity)
+
+        # Idle timer to clear secrets from memory
+        self.secret_idle_timer = QTimer(singleShot=True)
+        self.secret_idle_timer.setInterval(self._effective_secret_cache_idle_minutes() * 60 * 1000)
+        self.secret_idle_timer.timeout.connect(self._on_infocus_inactivity_timeout)
 
         # Focus cooldown timer for screen recording hide
         self.cooldown_timer = QTimer()
@@ -278,6 +208,11 @@ class MainWindow(QMainWindow):
         self.screen_recorder_checker.screen_recording_changed.connect(self.on_screen_recording_changed)
         self.screen_recorder_thread.start()
 
+        self.mem_guard_thread = None
+        self.mem_guard_checker = None
+        self._configure_mem_guard()
+        self._warn_secret_cache_limit()
+
         # Track window focus
         self.installEventFilter(self)
     
@@ -289,7 +224,7 @@ class MainWindow(QMainWindow):
         try:
             dialog = UpdateDialog(self)
             dialog.exec()
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to open update dialog: {e}")
             PangMessageBox.critical(self, "Update Error", f"Failed to open update dialog:\n{e}")
     
@@ -307,9 +242,12 @@ class MainWindow(QMainWindow):
             # Preferences were saved by dlg.accept()
             # Just update the editor with the new setting
             self.editor.set_tab_setting(PangPreferences.tab_setting)
+            self.secret_idle_timer.setInterval(self._effective_secret_cache_idle_minutes() * 60 * 1000)
+            self._configure_mem_guard()
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.WindowActivate:
+            self._apply_focus_reauth_policy()
             if PangPreferences.screen_recording_hide_enabled and not self.allow_editor_activation:
                 self.cooldown_remaining = PangPreferences.recording_cooldown
                 self.update_hidden_label_for_cooldown()
@@ -318,6 +256,8 @@ class MainWindow(QMainWindow):
         elif event.type() == QEvent.Type.WindowDeactivate:
             if PangPreferences.screen_recording_hide_enabled:
                 self.cooldown_timer.stop()
+            if PangPreferences.session_cache_enabled and PangPreferences.session_reauth_on_focus_loss:
+                self._focus_lost_at = monotonic()
             return False
         return super().eventFilter(obj, event)
     
@@ -327,9 +267,9 @@ class MainWindow(QMainWindow):
             self.allow_editor_activation = True
             self.cooldown_timer.stop()
             self.hidden_label.setText(
-                f"Screen recording program detected.\n"
-                f"Make sure to close this window before recording.\n"
-                f"Click here to restore editor."
+                "Screen recording program detected.\n"
+                "Make sure to close this window before recording.\n"
+                "Click here to restore editor."
             )
         else:
             self.update_hidden_label_for_cooldown()
@@ -357,6 +297,8 @@ class MainWindow(QMainWindow):
         if active_window is None or not (active_window == self or self.isAncestorOf(active_window)):
             self.hidden_label.setText("Editor hidden due to focus loss. Click here to restore editor.")
             self.hide_editor_and_show_label()
+
+        self._apply_focus_reauth_policy()
     
     def hide_editor_and_show_label(self):
         self.editor.hide()
@@ -377,6 +319,8 @@ class MainWindow(QMainWindow):
         self.try_restore_editor()
 
     def check_focus_time(self):
+        if not hasattr(self, "focus_timer"):
+            return
         if self.focus_timer.isValid():
             elapsed_sec = self.focus_timer.elapsed() / 1000
             if elapsed_sec >= PangPreferences.recording_cooldown:
@@ -388,7 +332,7 @@ class MainWindow(QMainWindow):
         try:
             self.usb_cache = list_usb_drives()
             logger.debug(f"USB cache refreshed: {len(self.usb_cache)} drives found")
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             logger.error(f"Failed to refresh USB cache: {e}")
             self.usb_cache = []
 
@@ -400,12 +344,12 @@ class MainWindow(QMainWindow):
         if not isinstance(path, str):
             raise ValidationError("File path must be a string")
         
-        # Check for path traversal attempts
-        if ".." in path or path.startswith("/") and not os.path.isabs(path):
-            raise ValidationError("Invalid file path detected")
+        normalized = os.path.abspath(path)
+        if os.path.isdir(normalized):
+            raise ValidationError("Path points to a directory, expected an .enc file")
         
         # Check file extension
-        if not path.lower().endswith('.enc'):
+        if not normalized.lower().endswith('.enc'):
             raise ValidationError("File must have .enc extension")
         
         return True
@@ -425,8 +369,19 @@ class MainWindow(QMainWindow):
         
         if not (has_upper and has_lower and has_digit):
             logger.warning("Password does not meet complexity requirements")
-        
+            return False
+
         return True
+
+    def confirm_weak_password(self) -> bool:
+        ret = PangMessageBox.question(
+            self,
+            "Weak Password",
+            "The password does not meet complexity requirements. Continue anyway?",
+            buttons=PangMessageBox.StandardButton.Yes | PangMessageBox.StandardButton.No,
+            default=PangMessageBox.StandardButton.No,
+        )
+        return ret == PangMessageBox.StandardButton.Yes
 
     def show_progress(self, message: str, maximum: int = 0):
         """Show progress bar with message."""
@@ -450,6 +405,31 @@ class MainWindow(QMainWindow):
     def on_text_changed(self):
         self.autosave_timer.start()  # reset timer on each key press
 
+    def _on_editor_activity(self):
+        self._last_editor_activity_at = monotonic()
+        if PangPreferences.session_cache_enabled and (self.cached_password is not None or self.cached_usb_key is not None):
+            self.reset_secret_idle_timer()
+
+    def _effective_secret_cache_idle_minutes(self) -> int:
+        configured = int(getattr(PangPreferences, "session_infocus_inactivity_minutes", self.DEFAULT_SECRET_CACHE_IDLE_MINUTES))
+        return max(1, min(configured, self.MAX_SECRET_CACHE_IDLE_MINUTES))
+
+    def _warn_secret_cache_limit(self) -> None:
+        if not PangPreferences.session_cache_enabled or self._secret_cache_notice_logged:
+            return
+        logger.warning(
+            "Session secret caching uses best-effort obfuscation only and is limited to %s minutes of in-focus inactivity.",
+            self._effective_secret_cache_idle_minutes(),
+        )
+        self._secret_cache_notice_logged = True
+
+    def _on_infocus_inactivity_timeout(self):
+        if not PangPreferences.session_cache_enabled:
+            return
+        if not PangPreferences.session_infocus_inactivity_reauth_enabled:
+            return
+        self.clear_cached_secrets()
+
     def autosave(self):
         """Autosave with improved error handling and logging."""
         if not self.operation_mutex.tryLock():
@@ -472,20 +452,26 @@ class MainWindow(QMainWindow):
             logger.debug(f"Autosaving to {self.saved_file_path}")
             
             # Encrypt current editor content
+            password_bytes = self._get_cached_password_bytes()
+            usb_key = self._get_cached_usb_key()
             encrypt_file(
-                self.editor.toHtml().encode("utf-8"),
+                self._serialize_editor_content(),
                 self.saved_file_path,
                 self.current_mode,
                 self.cached_uuid,
-                password=self.cached_password,
-                usb_key=self.cached_usb_key,
+                password=password_bytes,
+                usb_key=bytes(usb_key) if usb_key else None,
+                content_mode=self.current_content_mode,
             )
+            self._clear_temporary_bytes(password_bytes)
+            self._clear_temporary_bytes(usb_key)
+            self.reset_secret_idle_timer()
             logger.info(f"Autosaved encrypted file to {self.saved_file_path}")
             
         except CryptographyError as e:
             logger.error(f"Cryptography error during autosave: {e}")
             PangMessageBox.warning(self, "Autosave failed", f"Encryption error: {e}")
-        except Exception as e:
+        except (ValueError, TypeError, OSError, RuntimeError) as e:
             logger.error(f"Unexpected error during autosave: {e}")
             PangMessageBox.warning(self, "Autosave failed", f"Could not autosave encrypted file:\n{e}")
         finally:
@@ -509,7 +495,7 @@ class MainWindow(QMainWindow):
                 return None
             return usbs
             
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             logger.error(f"Error detecting USB drives: {e}")
             PangMessageBox.critical(
                 self,
@@ -539,19 +525,25 @@ class MainWindow(QMainWindow):
             logger.info(f"Selected encryption mode: {mode}")
 
             # Get password if needed
-            password = None
+            password_bytes = None
             if mode in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY]:
-                pwd_dlg = PasswordDialog(self, warning=(mode == MODE_KEY_ONLY))
+                pwd_dlg = PasswordDialog(self, warning=False)
                 if not pwd_dlg.exec_():
                     return
-                password = pwd_dlg.password
+                password_text = pwd_dlg.password
                 
                 # Validate password
                 try:
-                    self.validate_password(password)
+                    is_strong = self.validate_password(password_text)
                 except ValidationError as e:
                     PangMessageBox.warning(self, "Password Validation", str(e))
-                    # Continue anyway - validation is advisory
+                    return
+
+                if not is_strong and not self.confirm_weak_password():
+                    return
+
+                password_bytes = bytearray(password_text.encode("utf-8"))
+                password_text = None
 
             # Get USB key if needed
             random_key = None
@@ -606,7 +598,7 @@ class MainWindow(QMainWindow):
                 try:
                     random_key, _ = create_or_load_key(selected_usb_path, path, file_uuid)
                     logger.info("USB key created/loaded successfully")
-                except Exception as e:
+                except (ValueError, OSError, RuntimeError) as e:
                     logger.error(f"Failed to create/load USB key: {e}")
                     raise USBKeyError(f"Failed to create USB key: {e}")
 
@@ -615,18 +607,19 @@ class MainWindow(QMainWindow):
 
             # Encrypt and save
             try:
-                content = self.editor.toHtml().encode("utf-8")
+                content = self._serialize_editor_content()
                 encrypt_file(
                     content,
                     path,
                     mode,
                     file_uuid,
-                    password=password,
-                    usb_key=random_key
+                    password=password_bytes,
+                    usb_key=random_key,
+                    content_mode=self.current_content_mode
                 )
                 logger.info(f"File encrypted and saved to {path}")
                 
-            except Exception as e:
+            except (ValueError, TypeError, OSError, RuntimeError) as e:
                 logger.error(f"Encryption failed: {e}")
                 raise CryptographyError(f"Failed to encrypt file: {e}")
 
@@ -636,9 +629,26 @@ class MainWindow(QMainWindow):
             self.saved_file_path = path
             self.update_window_title(self.saved_file_path)
             self.current_mode = mode
+            self.header_version = HEADER_VERSION
             self.cached_uuid = file_uuid
-            self.cached_password = password
-            self.cached_usb_key = random_key
+            if PangPreferences.session_cache_enabled:
+                if password_bytes:
+                    self.cached_password = self._obfuscate_secret(password_bytes)
+                    self._clear_temporary_bytes(password_bytes)
+                else:
+                    self.cached_password = None
+
+                if random_key:
+                    key_bytes = bytearray(random_key)
+                    self.cached_usb_key = self._obfuscate_secret(key_bytes)
+                    self._clear_temporary_bytes(key_bytes)
+                    random_key = None
+                else:
+                    self.cached_usb_key = None
+                self.reset_secret_idle_timer()
+            else:
+                self.clear_cached_secrets()
+            self._clear_temporary_bytes(password_bytes)
 
             self.status_bar.showMessage("File saved successfully", 3000)
             PangMessageBox.information(self, "Success", "File saved successfully.")
@@ -652,41 +662,30 @@ class MainWindow(QMainWindow):
         except USBKeyError as e:
             logger.error(f"USB key error: {e}")
             PangMessageBox.critical(self, "USB Key Error", str(e))
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError) as e:
             logger.error(f"Unexpected error during save: {e}")
             PangMessageBox.critical(self, "Save Failed", f"An unexpected error occurred:\n{e}")
         finally:
             self.hide_progress()
             self.operation_mutex.unlock()
 
-    def secure_clear_memory(self, data: bytes) -> None:
-        """Securely clear sensitive data from memory."""
-        if data:
-            # Since Python bytes are immutable, we can't directly overwrite them.
-            # Instead, we overwrite copies and let the original be garbage collected.
-            # This is not perfect, but prevents simple memory dumps.
-            try:
-                # Create copies and overwrite them (less effective than direct memory manipulation)
-                size = len(data)
-                if size > 0:
-                    # Fill with zeros (note: this doesn't modify the original data)
-                    zero_data = b'\x00' * size
-                    # Overwrite with random data
-                    import os
-                    random_data = os.urandom(size)
+    def best_effort_clear_memory(self, data: bytes | bytearray | None) -> None:
+        """Best-effort clearing for sensitive data in memory.
 
-                    # Force garbage collection to clear original data faster
-                    import gc
-                    del data
-                    gc.collect()
+        Note: immutable bytes/str values cannot be reliably wiped in CPython.
+        """
+        if data is None:
+            return
 
-                    logger.debug("Memory cleared (best-effort for immutable bytes)")
-                else:
-                    # Empty data, nothing to clear
-                    pass
+        try:
+            if isinstance(data, bytearray):
+                for i in range(len(data)):
+                    data[i] = 0
+                return
 
-            except Exception as e:
-                logger.warning(f"Failed to securely clear memory: {e}")
+            logger.debug("Best-effort clear requested for immutable object; cannot guarantee wipe")
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Failed to securely clear memory: {e}")
 
     def open_file(self, path: str | None = None):
         """Open file with enhanced validation, progress indication, and security."""
@@ -727,26 +726,45 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Reading file header...")
 
             # Read and validate file header
+            file_uuid = None
             try:
                 with open(path, "rb") as f:
-                    mode_byte = f.read(1)
-                    if not mode_byte:
+                    settings = f.read(SETTINGS_SIZE)
+                    if len(settings) != SETTINGS_SIZE:
                         raise ValidationError("File is empty or invalid")
-                    
+
+                    _salt = f.read(16)
+                    file_uuid_bytes = f.read(16)
+                    if len(file_uuid_bytes) != 16:
+                        raise ValidationError("Invalid file UUID in header")
+                    file_uuid = UUID(bytes=file_uuid_bytes)
+
+                    header_version = decode_version(settings[0:2])
+                    if header_version != HEADER_VERSION:
+                        raise ValidationError(f"Unsupported file version: {header_version}")
+
+                    mode_byte = settings[2]
                     try:
-                        mode = EncryptModeType(mode_byte[0])
+                        mode = EncryptModeType(mode_byte)
                     except ValueError:
-                        raise ValidationError(f"Unknown encryption mode: {mode_byte[0]}")
-                    
+                        raise ValidationError(f"Unknown encryption mode: {mode_byte}")
+
                     if mode not in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
                         raise ValidationError(f"Unsupported encryption mode: {mode}")
-                        
+
+                    content_mode = settings[CONTENT_MODE_OFFSET]
+                    if content_mode not in (CONTENT_MODE_PLAINTEXT, CONTENT_MODE_HTML):
+                        raise ValidationError("Unsupported content mode in file header")
+
+                    self.header_version = header_version
+                    self.current_content_mode = content_mode
+                    self.editor.set_content_mode(content_mode == CONTENT_MODE_HTML)
                     logger.info(f"File uses encryption mode: {mode}")
                     
             except ValidationError as e:
                 PangMessageBox.critical(self, "Invalid File Format", str(e))
                 return
-            except Exception as e:
+            except (OSError, ValueError, RuntimeError) as e:
                 logger.error(f"Failed to read file header: {e}")
                 PangMessageBox.critical(self, "File Read Error", f"Failed to read file: {e}")
                 return
@@ -754,17 +772,19 @@ class MainWindow(QMainWindow):
             self.update_progress(25)
             
             # Get credentials based on encryption mode
-            password = None
+            password_bytes = None
             random_key = None
-            file_uuid = None
+            opened_header_uuid = file_uuid
 
             # Get password if needed
             if mode in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY]:
                 self.status_bar.showMessage("Waiting for password...")
-                pwd_dlg = PasswordDialog(self, warning=(mode == MODE_KEY_ONLY))
+                pwd_dlg = PasswordDialog(self, warning=False)
                 if not pwd_dlg.exec_():
                     return
-                password = pwd_dlg.password
+                password_text = pwd_dlg.password
+                password_bytes = bytearray(password_text.encode("utf-8"))
+                password_text = None
                 logger.debug("Password provided for decryption")
 
             self.update_progress(40)
@@ -784,21 +804,26 @@ class MainWindow(QMainWindow):
                 logger.info(f"Selected USB drive: {selected_usb_path}")
 
                 try:
-                    random_key, file_uuid = create_or_load_key(selected_usb_path, path, create=False)
+                    random_key, loaded_uuid = create_or_load_key(selected_usb_path, path, create=False)
+                    if loaded_uuid is not None:
+                        file_uuid = loaded_uuid
                     logger.info("USB key loaded successfully")
-                except Exception as e:
+                except (ValueError, OSError, RuntimeError) as e:
                     logger.error(f"Failed to load USB key: {e}")
                     raise USBKeyError(f"Failed to load USB key: {e}")
+
+            if file_uuid is None:
+                file_uuid = opened_header_uuid
 
             self.update_progress(60)
             self.status_bar.showMessage("Decrypting file...")
 
             # Decrypt file
             try:
-                plaintext = decrypt_file(path, password=password, usb_key=random_key)
+                plaintext = decrypt_file(path, password=password_bytes, usb_key=random_key)
                 logger.info(f"File decrypted successfully: {len(plaintext)} bytes")
                 
-            except Exception as e:
+            except (ValueError, TypeError, OSError, RuntimeError) as e:
                 logger.error(f"Decryption failed: {e}")
                 raise CryptographyError(f"Failed to decrypt file: {e}")
 
@@ -808,10 +833,10 @@ class MainWindow(QMainWindow):
             # Load content into editor
             try:
                 content_str = plaintext.decode("utf-8")
-                self.editor.setHtml(content_str)
+                self._load_editor_content(content_str)
                 
                 # Securely clear plaintext from memory
-                self.secure_clear_memory(plaintext)
+                self.best_effort_clear_memory(plaintext)
                 
             except UnicodeDecodeError as e:
                 logger.error(f"Failed to decode file content: {e}")
@@ -829,12 +854,29 @@ class MainWindow(QMainWindow):
             self.update_window_title(self.saved_file_path)
             self.current_mode = mode
             self.cached_uuid = file_uuid
-            self.cached_password = password
-            self.cached_usb_key = random_key
+            if PangPreferences.session_cache_enabled:
+                if password_bytes:
+                    self.cached_password = self._obfuscate_secret(password_bytes)
+                    self._clear_temporary_bytes(password_bytes)
+                else:
+                    self.cached_password = None
+
+                if random_key:
+                    key_bytes = bytearray(random_key)
+                    self.cached_usb_key = self._obfuscate_secret(key_bytes)
+                    self._clear_temporary_bytes(key_bytes)
+                    random_key = None
+                else:
+                    self.cached_usb_key = None
+                self.reset_secret_idle_timer()
+            else:
+                self.clear_cached_secrets()
+            self._clear_temporary_bytes(password_bytes)
 
             self.status_bar.showMessage("File opened successfully", 3000)
             PangMessageBox.information(self, "Success", "File opened successfully.")
             logger.info(f"File opened successfully: {path}")
+            self.update_file_info_label()
             
         except ValidationError as e:
             logger.error(f"Validation error: {e}")
@@ -845,7 +887,7 @@ class MainWindow(QMainWindow):
         except USBKeyError as e:
             logger.error(f"USB key error: {e}")
             PangMessageBox.critical(self, "USB Key Error", str(e))
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError, TypeError) as e:
             logger.error(f"Unexpected error during file open: {e}")
             PangMessageBox.critical(self, "Open Failed", f"An unexpected error occurred:\n{e}")
         finally:
@@ -874,9 +916,427 @@ class MainWindow(QMainWindow):
         self.saved_file_path = None
         self.update_window_title(self.saved_file_path)
         self.current_mode = None
+        self.current_content_mode = CONTENT_MODE_PLAINTEXT
+        self.header_version = HEADER_VERSION
+        self.editor.set_content_mode(False)
+        self.clear_cached_secrets()
+        self.editor.clear()
+        self.update_file_info_label()
+
+    def _xor_with_mask(self, data: bytes | bytearray) -> bytearray:
+        mask = self._secret_mask
+        return bytearray(b ^ mask[i % len(mask)] for i, b in enumerate(bytes(data)))
+
+    def _obfuscate_secret(self, secret: bytes | bytearray) -> bytearray:
+        return self._xor_with_mask(secret)
+
+    def _deobfuscate_secret(self, secret: bytearray) -> bytearray:
+        return self._xor_with_mask(bytes(secret))
+
+    def _get_cached_password_bytes(self) -> Optional[bytearray]:
+        if self.cached_password is None:
+            return None
+        self.reset_secret_idle_timer()
+        secret = self._deobfuscate_secret(self.cached_password)
+        return secret
+
+    def _get_cached_usb_key(self) -> Optional[bytearray]:
+        if self.cached_usb_key is None:
+            return None
+        self.reset_secret_idle_timer()
+        secret = self._deobfuscate_secret(self.cached_usb_key)
+        return secret
+
+    def _clear_temporary_bytes(self, data: Optional[bytearray]) -> None:
+        if data is None:
+            return
+        try:
+            self.best_effort_clear_memory(data)
+        except (TypeError, ValueError) as e:
+            logger.debug(f"Temporary bytes clear failed: {e}")
+
+    def clear_cached_secrets(self):
+        self.best_effort_clear_memory(self.cached_password)
+        self.best_effort_clear_memory(self.cached_usb_key)
         self.cached_password = None
         self.cached_usb_key = None
-        self.editor.clear()
+        self.cached_uuid = None
+        self.secret_idle_timer.stop()
+
+    def _read_file_uuid(self, path: str) -> Optional[UUID]:
+        try:
+            with open(path, "rb") as f:
+                if len(f.read(SETTINGS_SIZE)) != SETTINGS_SIZE:
+                    return None
+                if len(f.read(16)) != 16:  # salt
+                    return None
+                uid = f.read(16)
+                if len(uid) != 16:
+                    return None
+                return UUID(bytes=uid)
+        except (OSError, ValueError):
+            return None
+
+    def reset_secret_idle_timer(self):
+        if PangPreferences.session_cache_enabled and PangPreferences.session_infocus_inactivity_reauth_enabled:
+            self.secret_idle_timer.setInterval(self._effective_secret_cache_idle_minutes() * 60 * 1000)
+            self.secret_idle_timer.start()
+        else:
+            self.secret_idle_timer.stop()
+
+    def _apply_focus_reauth_policy(self):
+        if not PangPreferences.session_cache_enabled:
+            return
+        if not PangPreferences.session_reauth_on_focus_loss:
+            self._focus_lost_at = None
+            return
+        if self._focus_lost_at is None:
+            return
+        elapsed = monotonic() - self._focus_lost_at
+        timeout_sec = PangPreferences.session_reauth_minutes * 60
+        if elapsed >= timeout_sec:
+            self.clear_cached_secrets()
+        self._focus_lost_at = None
+
+    def _configure_mem_guard(self):
+        if self._mem_guard_disabled_until_restart:
+            return
+        if not self._stop_mem_guard():
+            logger.error("Skipping mem guard reconfiguration because previous worker is still shutting down")
+            self._mem_guard_disabled_until_restart = True
+            self.status_bar.showMessage("Memory guard disabled until restart (worker did not stop cleanly)", 8000)
+            return
+        if not PangPreferences.session_cache_enabled:
+            return
+        if not is_mem_guard_supported():
+            return
+        mode_value = PangPreferences.mem_guard_mode
+        if mode_value == MemGuardMode.OFF.value:
+            return
+
+        try:
+            mode = MemGuardMode(mode_value)
+        except ValueError:
+            return
+
+        self.mem_guard_thread = QThread()
+        self.mem_guard_checker = MemGuardChecker(
+            mode=mode,
+            whitelist=PangPreferences.mem_guard_whitelist,
+            check_interval_ms=PangPreferences.mem_guard_scan_interval_ms,
+            pid_handle_cache_cap=PangPreferences.mem_guard_pid_cache_cap,
+        )
+        self.mem_guard_checker.moveToThread(self.mem_guard_thread)
+        self.mem_guard_thread.started.connect(self.mem_guard_checker.run)
+        self.mem_guard_checker.memory_probe_detected.connect(self.on_memory_probe_detected)
+        self.mem_guard_thread.start()
+
+    def _stop_mem_guard(self) -> bool:
+        if self.mem_guard_checker is not None:
+            self.mem_guard_checker.stop()
+        if self.mem_guard_thread is not None:
+            self.mem_guard_thread.quit()
+            if not self.mem_guard_thread.wait(5000):
+                logger.error("Mem guard thread did not stop gracefully; terminate() is disabled for safety")
+                return False
+        self.mem_guard_checker = None
+        self.mem_guard_thread = None
+        return True
+
+    def _panic_path(self) -> Optional[str]:
+        if not self.saved_file_path:
+            return None
+        return f"{self.saved_file_path}.panic.enc"
+
+    def _panic_meta_path(self) -> Optional[str]:
+        panic = self._panic_path()
+        if not panic:
+            return None
+        return f"{panic}.meta"
+
+    def _create_panic_snapshot(self) -> bool:
+        panic_path = self._panic_path()
+        if not panic_path or self.cached_uuid is None or self.current_mode is None:
+            return False
+
+        password_bytes = self._get_cached_password_bytes()
+        usb_key = self._get_cached_usb_key()
+        try:
+            content = self._serialize_editor_content()
+            encrypt_file(
+                content,
+                panic_path,
+                self.current_mode,
+                self.cached_uuid,
+                password=password_bytes,
+                usb_key=bytes(usb_key) if usb_key else None,
+                content_mode=self.current_content_mode,
+            )
+            meta_path = self._panic_meta_path()
+            if meta_path:
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump({"saved_at": datetime.now(timezone.utc).isoformat()}, f, indent=2)
+            self._panic_recovery_path = panic_path
+            return True
+        except (ValueError, TypeError, OSError, RuntimeError):
+            # Offer save-as fallback for panic snapshot
+            fallback_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save panic snapshot as...",
+                filter="Encrypted Files (*.enc)",
+            )
+            if not fallback_path:
+                return False
+            try:
+                encrypt_file(
+                    content,
+                    fallback_path,
+                    self.current_mode,
+                    self.cached_uuid,
+                    password=password_bytes,
+                    usb_key=bytes(usb_key) if usb_key else None,
+                    content_mode=self.current_content_mode,
+                )
+                self._panic_recovery_path = fallback_path
+                return True
+            except (ValueError, TypeError, OSError, RuntimeError):
+                return False
+        finally:
+            self._clear_temporary_bytes(password_bytes)
+            self._clear_temporary_bytes(usb_key)
+
+    def _restore_from_panic_snapshot(self) -> bool:
+        path = self._panic_recovery_path or self._panic_path()
+        if not path or not os.path.exists(path) or self.current_mode is None:
+            return False
+
+        password_bytes = None
+        usb_key = None
+        try:
+            if self.current_mode in [MODE_PASSWORD_ONLY, MODE_PASSWORD_PLUS_KEY]:
+                pwd_dlg = PasswordDialog(self)
+                if not pwd_dlg.exec_():
+                    return False
+                password_bytes = bytearray(pwd_dlg.password.encode("utf-8"))
+
+            if self.current_mode in [MODE_PASSWORD_PLUS_KEY, MODE_KEY_ONLY]:
+                usbs = self.check_usb_present()
+                if not usbs:
+                    return False
+                usb_dlg = USBSelectDialog(usbs, self)
+                if not usb_dlg.exec_():
+                    return False
+                selected_usb_path = usb_dlg.selected_usb
+                usb_key, _ = create_or_load_key(selected_usb_path, self.saved_file_path or path, create=False)
+
+            plaintext = decrypt_file(path, password=password_bytes, usb_key=usb_key)
+            content_str = plaintext.decode("utf-8")
+            self._load_editor_content(content_str)
+            self.best_effort_clear_memory(plaintext)
+
+            panic_uuid = self._read_file_uuid(path)
+            if panic_uuid is not None:
+                self.cached_uuid = panic_uuid
+
+            if PangPreferences.session_cache_enabled:
+                self.cached_password = self._obfuscate_secret(password_bytes) if password_bytes else None
+                if usb_key:
+                    key_bytes = bytearray(usb_key)
+                    self.cached_usb_key = self._obfuscate_secret(key_bytes)
+                    self._clear_temporary_bytes(key_bytes)
+                else:
+                    self.cached_usb_key = None
+                self.reset_secret_idle_timer()
+
+            if PangPreferences.auto_delete_panic_files:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                meta_path = self._panic_meta_path()
+                if meta_path:
+                    try:
+                        os.remove(meta_path)
+                    except OSError:
+                        pass
+            return True
+        except (ValueError, TypeError, OSError, RuntimeError, UnicodeDecodeError):
+            return False
+        finally:
+            self._clear_temporary_bytes(password_bytes)
+            if isinstance(usb_key, bytearray):
+                self._clear_temporary_bytes(usb_key)
+
+    def _enqueue_mem_guard_finding(self, finding: MemGuardFinding) -> None:
+        key = (
+            int(finding.pid),
+            finding.severity.value,
+            int(finding.access_mask),
+            finding.process_path or "",
+        )
+        if key in self._pending_mem_guard_keys:
+            return
+        self._pending_mem_guard_keys.add(key)
+        self._pending_mem_guard_findings.append(finding)
+
+    def _process_next_mem_guard_finding(self) -> None:
+        if self._mem_guard_handling or not self._pending_mem_guard_findings:
+            return
+
+        finding = self._pending_mem_guard_findings.pop(0)
+        key = (
+            int(finding.pid),
+            finding.severity.value,
+            int(finding.access_mask),
+            finding.process_path or "",
+        )
+        self._pending_mem_guard_keys.discard(key)
+
+        self._mem_guard_handling = True
+        try:
+            panic_saved = self._create_panic_snapshot()
+            self.clear_cached_secrets()
+            self.editor.clear()
+            self.hide_editor_and_show_label()
+
+            msg = PangMessageBox(self)
+            msg.setWindowTitle("Memory Access Warning")
+            details = (
+                f"Process \"{finding.process_name}\" (PID {finding.pid}) appears to be reading process memory.\n\n"
+                "If this is expected behaviour (for example anti-cheat/EDR), you can continue.\n"
+            )
+            if not panic_saved:
+                details += "\nWarning: could not save panic snapshot, unsaved work may be lost."
+            msg.setText(details)
+            msg.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+            whitelist_btn = msg.addButton("Continue + whitelist application", QMessageBox.ButtonRole.AcceptRole)
+            exit_btn = msg.addButton("Exit program", QMessageBox.ButtonRole.DestructiveRole)
+            msg.setMinimumWidth(640)
+            msg.adjustSize()
+            for btn in msg.buttons():
+                btn.setMinimumWidth(190)
+            msg.exec()
+
+            clicked = msg.clickedButton()
+            if clicked == exit_btn:
+                self.close()
+                return
+
+            confirm = PangMessageBox.question(
+                self,
+                "Risk Confirmation",
+                "I understand the risks and want to continue.",
+                buttons=PangMessageBox.StandardButton.Yes | PangMessageBox.StandardButton.No,
+                default=PangMessageBox.StandardButton.No,
+            )
+            if confirm != PangMessageBox.StandardButton.Yes:
+                self.close()
+                return
+
+            if clicked == whitelist_btn and finding.process_path:
+                current_entries = PangPreferences.mem_guard_whitelist
+                exists = False
+                for item in current_entries:
+                    if isinstance(item, dict) and item.get("path") == finding.process_path and str(item.get("sha256", "")).lower() == finding.sha256.lower():
+                        exists = True
+                        break
+                if not exists:
+                    PangPreferences.mem_guard_whitelist.append(
+                        {
+                            "path": finding.process_path,
+                            "sha256": finding.sha256,
+                        }
+                    )
+                    PangPreferences.save_preferences()
+                    self._configure_mem_guard()
+
+            if panic_saved:
+                restored = self._restore_from_panic_snapshot()
+                if not restored:
+                    PangMessageBox.warning(self, "Restore Failed", "Could not restore panic snapshot. Re-open file manually.")
+            self.try_restore_editor()
+        finally:
+            self._mem_guard_handling = False
+            if self._pending_mem_guard_findings:
+                QTimer.singleShot(0, self._process_next_mem_guard_finding)
+
+    def on_memory_probe_detected(self, finding: MemGuardFinding):
+        self._enqueue_mem_guard_finding(finding)
+        self._process_next_mem_guard_finding()
+
+    def closeEvent(self, event):
+        self._stop_mem_guard()
+        if self.screen_recorder_checker is not None:
+            self.screen_recorder_checker.stop()
+        if self.screen_recorder_thread is not None:
+            self.screen_recorder_thread.quit()
+            self.screen_recorder_thread.wait(1500)
+        super().closeEvent(event)
+
+    def show_content_mode_menu(self, pos):
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background-color: #222; color: #eee; border: 1px solid #6B21A8; }
+            QMenu::item:selected { background-color: #581C87; }
+        """)
+
+        if self.current_content_mode == CONTENT_MODE_PLAINTEXT:
+            menu.addAction("Convert to HTML", self.convert_plaintext_to_html)
+        else:
+            menu.addAction("Convert to plaintext + keep HTML", self.convert_html_to_plaintext_keep_html)
+            menu.addAction("Convert to plaintext (discard HTML)", self.convert_html_to_plaintext_discard_html)
+
+        menu.exec(self.mode_label.mapToGlobal(pos))
+
+    def convert_plaintext_to_html(self):
+        plaintext = self.editor.toPlainText()
+        self.editor.setHtml(plaintext)
+        # Reformat/normalize through Qt's document pipeline
+        normalized = self.editor.toHtml()
+        self.editor.setHtml(normalized)
+        self.current_content_mode = CONTENT_MODE_HTML
+        self.editor.set_content_mode(True)
+        self.update_file_info_label()
+
+    def convert_html_to_plaintext_keep_html(self):
+        html = self.editor.toHtml()
+        normalized = html.replace("\r\n", "\n").replace("\r", "\n")
+        self.editor.setPlainText(normalized)
+        self.current_content_mode = CONTENT_MODE_PLAINTEXT
+        self.editor.set_content_mode(False)
+        self.update_file_info_label()
+
+    def convert_html_to_plaintext_discard_html(self):
+        text = self.editor.toPlainText()
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        self.editor.setPlainText(normalized)
+        self.current_content_mode = CONTENT_MODE_PLAINTEXT
+        self.editor.set_content_mode(False)
+        self.update_file_info_label()
+
+    def _serialize_editor_content(self) -> bytes:
+        if self.current_content_mode == CONTENT_MODE_HTML:
+            return self.editor.toHtml().encode("utf-8")
+        return self.editor.toPlainText().encode("utf-8")
+
+    def _load_editor_content(self, content: str) -> None:
+        if self.current_content_mode == CONTENT_MODE_HTML:
+            self.editor.setHtml(content)
+            self.editor.set_content_mode(True)
+        else:
+            self.editor.setPlainText(content)
+            self.editor.set_content_mode(False)
+
+    def update_file_info_label(self):
+        mode_label = "Plaintext" if self.current_content_mode == CONTENT_MODE_PLAINTEXT else "HTML"
+        self.mode_label.setText(f"{mode_label} mode")
+        if not self.saved_file_path:
+            self.file_info_label.setText("No file loaded")
+            return
+        enc_mode = self.current_mode.name if self.current_mode else "Unknown"
+        self.file_info_label.setText(
+            f"Format v{self.header_version} | {enc_mode} | {mode_label}"
+        )
     
     def update_window_title(self, filename: str | None):
         base_title = "PangCrypter"
@@ -887,8 +1347,17 @@ class MainWindow(QMainWindow):
         else:
             self.setWindowTitle(base_title)
 
+        self.update_file_info_label()
+
 def main():
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="PangCrypter")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args, remaining = parser.parse_known_args()
+
+    configure_logging(args.debug)
+
+    app = QApplication([sys.argv[0]] + remaining)
+    app.setStyle("Fusion")
     win = MainWindow()
 
     # If there's an argument, try opening it
@@ -897,7 +1366,7 @@ def main():
         if os.path.isfile(file_arg) and file_arg.lower().endswith(".enc"):
             try:
                 win.open_file(file_arg)
-            except Exception as e:
+            except (OSError, RuntimeError, ValueError) as e:
                 print(f"Failed to open {file_arg}: {e}")
 
     win.show()
