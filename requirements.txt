@@ -6,3 +6,4 @@ argon2-cffi>=23.1.0
 requests>=2.31.0
 packaging>=23.0
 psutil>=5.9.0
+keyring>=25.0.0
