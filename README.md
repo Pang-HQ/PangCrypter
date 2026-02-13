@@ -1,202 +1,177 @@
 # PangCrypter
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+PangCrypter is an encrypted text editor for `.enc` files. It combines authenticated encryption, optional USB-bound key material, and a desktop UI for editing encrypted notes.
 
-PangCrypter is a secure text editor with military-grade encryption capabilities. It provides a user-friendly interface for encrypting and editing sensitive files with strong AES-256 encryption, featuring hardware-tied security through USB key binding.
+<details>
+<summary><strong>Table of Contents</strong></summary>
 
-## ✨ Features
+- [General Information](#general-information)
+- [Project Highlights](#project-highlights)
+- [Platform Support](#platform-support)
+- [Using PangCrypter](#using-pangcrypter)
+  - [Install (recommended: GitHub Releases)](#install-recommended-github-releases)
+  - [Install (from source)](#install-from-source)
+  - [Encryption modes](#encryption-modes)
+  - [Auto-updates](#auto-updates)
+  - [Manual update verification (step-by-step)](#manual-update-verification-step-by-step)
+- [Security Notes](#security-notes)
+  - [What this protects against](#what-this-protects-against)
+  - [What this does NOT protect against](#what-this-does-not-protect-against)
+- [File Format (v1)](#file-format-v1)
+- [Development](#development)
+- [Contributing](#contributing)
+- [License](#license)
+- [Contact](#contact)
 
-### 🔐 Advanced Encryption
-- **AES-256 Encryption**: Military-grade encryption for maximum security
-- **Multiple Encryption Modes**:
-  - Password-only encryption
-  - USB key-only encryption (hardware-tied)
-  - Password + USB key hybrid encryption
-- **Secure Key Storage**: Hidden key storage on removable drives
+</details>
 
-### 🎨 Modern User Interface
-- **Dark Theme**: Easy on the eyes with a professional dark interface
-- **Rich Text Editor**: Full-featured text editing with formatting support
-- **Screen Recording Protection**: Automatic editor hiding during screen recording
-- **Focus Protection**: Editor hides when focus is lost (configurable)
+## General Information
 
-### 🔄 Auto-Updates
-- **Automatic Update Checking**: Built-in updater that checks for new versions
-- **One-Click Installation**: Seamless update process with progress tracking
-- **Safe Updates**: Backup creation and rollback capability
+- Website: https://www.panghq.com
+- Source code: https://github.com/Pang-HQ/PangCrypter
+- Issue tracker: https://github.com/Pang-HQ/PangCrypter/issues
 
-### 🛡️ Security Features
-- **Hardware-Bound Keys**: Encryption keys tied to specific USB drives
-- **Memory Security**: Secure memory clearing to prevent data leaks
-- **Process Monitoring**: Detection of screen recording software
-- **Secure File Handling**: Safe encryption/decryption with validation
+## Project Highlights
 
-## 🚀 Installation
+- XChaCha20-Poly1305 authenticated encryption
+- Three encryption modes: password-only, USB-only, password+USB
+- File header includes version, mode, content mode, salt, UUID, nonce
+- Update verification with SHA-256 and minisign
+- Backup/rollback logic during update installation
 
-### Option 1: Pre-built Executable (Recommended)
-1. Download the latest release from [GitHub Releases](https://github.com/Pang-Dev/PangCrypter/releases)
-2. Extract the ZIP file
-3. Run `PangCrypter.exe`
+## Platform Support
 
-### Option 2: From Source
+- Windows: Supported
+- Linux: Supported
+- macOS: Supported
+
+Platform behavior can vary by filesystem and keychain availability.
+
+## Using PangCrypter
+
+### Install (recommended: GitHub Releases)
+
+For normal use, install from the latest release artifacts:
+
+1. Go to: https://github.com/Pang-HQ/PangCrypter/releases
+2. Download the latest `PangCrypter.zip`
+3. Extract and run `PangCrypter.exe`
+
+### Install (from source)
+
+Source install is mainly for development/testing.
+
 ```bash
-# Clone the repository
-git clone https://github.com/Pang-Dev/PangCrypter.git
+git clone https://github.com/Pang-HQ/PangCrypter.git
 cd PangCrypter
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Run the application
-python run.py
-# Or as a module:
-python -m pangcrypter
 ```
 
-### Option 3: Using Setup.py
-```bash
-# Install as a Python package
-pip install .
+Optional editable install:
 
-# Or for development
+```bash
 pip install -e .
 ```
 
-## 📖 Usage
+### Encryption modes
 
-### Basic Usage
-1. **Launch**: Double-click `PangCrypter.exe` or run `python -m pangcrypter.main`
-2. **Create/Open Files**: Use **File → Open** to open encrypted `.enc` files
-3. **Edit Securely**: Work with your files in the built-in rich text editor
-4. **Save Encrypted**: Files are automatically encrypted when saved
+- **Password only**: key derived from password
+- **USB key only**: key material bound to selected drive
+- **Password + USB key**: combines both sources
 
-### Encryption Modes
+### Auto-updates
 
-#### Password-Only Mode
-- Uses a password for encryption/decryption
-- Good for personal use and file sharing
+- Open **Help → Check for Updates**
+- Updater checks release metadata, downloads ZIP, verifies SHA-256 and minisign, and installs with rollback support
 
-#### USB Key-Only Mode
-- Encryption key bound to a specific USB drive
-- Hardware-tied security - requires the USB drive to decrypt
-- Perfect for high-security scenarios
+### Session caching and memory guard
 
-#### Password + USB Key Mode
-- Combines password and hardware security
-- Maximum security with two-factor authentication
+- **Session caching** is enabled by default and keeps secrets only for an active session so autosave and panic snapshots can work.
+- Re-auth can be configured in Preferences to trigger after focus loss (1–5 minutes).
+- **Memory guard** is available on Windows only and supports:
+  - Off
+  - Normal (recommended): suspicious unknown/unsigned readers
+  - Ultra aggressive: any non-whitelisted reader with process VM access
+- If memory guard detects suspicious access, PangCrypter attempts to write `filename.enc.panic.enc`, clears plaintext/secrets, and prompts you to continue, whitelist, or exit.
+- Panic snapshots are overwritten on each incident; automatic deletion after successful restore is configurable.
 
-### Auto-Updates
-- **Check for Updates**: Go to **Help → Check for Updates**
-- **Automatic Updates**: The app can download and install updates automatically
-- **Safe Installation**: Creates backups and handles failures gracefully
+### Manual update verification (step-by-step)
 
-## 🏗️ Project Structure
+1. Download release artifacts:
+   - `PangCrypter.zip`
+   - `PangCrypter.zip.sha256`
+   - `PangCrypter.zip.minisig`
+2. Get the trusted minisign public key from a trusted channel.
+3. Verify SHA-256 digest:
+   - **Windows (PowerShell):**
+     ```powershell
+     Get-FileHash .\PangCrypter.zip -Algorithm SHA256
+     ```
+   - **Linux/macOS:**
+     ```bash
+     sha256sum PangCrypter.zip
+     ```
+   Confirm it matches `PangCrypter.zip.sha256`.
+4. Verify minisign signature:
+   ```bash
+   minisign -Vm PangCrypter.zip -x PangCrypter.zip.minisig -P "<TRUSTED_PUBLIC_KEY>"
+   ```
+   (Or use `-p minisign.pub` if the public key is in a file.)
+5. Install only when both checks succeed.
+
+## Security Notes
+
+### What this protects against
+
+- Offline disclosure when an attacker only has the encrypted `.enc` file
+- Undetected ciphertext/header tampering (authenticated encryption)
+- Unsigned/modified update payloads when verification is configured correctly
+- Accidental local exposure of USB key files via basic filesystem hardening
+
+### What this does NOT protect against
+
+- Malware/keyloggers on a running host
+- Full system compromise (admin/root-level attackers)
+- Credential loss (forgotten password and lost USB material)
+- Operational mistakes such as bypassing signature verification
+
+## File Format (v1)
 
 ```
-pangcrypter/
-├── core/                    # Core functionality
-│   ├── __init__.py
-│   ├── encrypt.py          # Encryption/decryption logic
-│   ├── key.py              # Key management
-│   └── updater.py          # Auto-update functionality
-├── ui/                     # User interface components
-│   ├── __init__.py
-│   ├── main_ui.py          # Main UI components
-│   ├── update_dialog.py    # Update dialog
-│   └── messagebox.py       # Custom message boxes
-├── utils/                  # Utility functions
-│   ├── __init__.py
-│   ├── preferences.py      # User preferences
-│   └── styles.py           # UI styling
-└── __init__.py            # Package initialization
-
-scripts/                    # Build and utility scripts
-├── build.py               # PyInstaller build script
-
-tests/                     # Test files
-├── test_*.py             # Unit and integration tests
-
-docs/                     # Documentation
-requirements.txt          # Python dependencies
-setup.py                 # Package setup script
-README.md                # This file
-LICENSE                  # MIT License
+settings (16 bytes):
+  - bytes 0-1: version (uint16)
+  - byte 2   : encryption mode
+  - byte 3   : content mode (0x00 plaintext, 0x01 HTML)
+  - bytes 4-15: reserved
+salt (16 bytes, zeroed for key-only mode)
+uuid (16 bytes)
+nonce (24 bytes)
+ciphertext (variable)
 ```
 
-## 🔧 Development
+## Development
 
-### Prerequisites
-- Python 3.8 or higher
-- PyQt6
-- Required dependencies (see `requirements.txt`)
+Run local checks:
 
-### Building from Source
 ```bash
-# Install development dependencies
-pip install -r requirements.txt
-pip install -e ".[dev]"
-
-# Run tests
-python -m pytest tests/
-
-# Build executable
-python scripts/build.py
+ruff check pangcrypter tests
+pytest -q
+bandit -r pangcrypter
+pip-audit -r requirements.txt
 ```
 
-### Code Quality
-- Follow PEP 8 style guidelines
-- Use type hints for better code documentation
-- Write comprehensive tests for new features
-- Update documentation for API changes
+Developer security and release process:
 
-## ⚠️ Security Notes
+- `docs/DEVELOPER_SECURITY_RELEASE.md`
 
-### Important Warnings
-- **Data Loss Risk**: Losing your USB drive or password means data recovery is likely impossible
-- **Backup Strategy**: Always maintain secure backups of critical encrypted files
-- **Hardware Security**: USB keys are bound to specific drives - moving keys between drives won't work
+## Contributing
 
-### Best Practices
-- Use strong, memorable passwords
-- Store USB drives in secure locations
-- Regularly backup your encryption keys (if using password-only mode)
-- Keep your operating system and antivirus software updated
-- Be aware of screen recording when working with sensitive data
+Contributions are welcome. Please open an issue before large changes.
 
-### Technical Security
-- **AES-256 Encryption**: Industry-standard encryption strength
-- **Hardware Binding**: Keys are cryptographically tied to USB drive hardware IDs
-- **Memory Security**: Sensitive data is securely cleared from memory
-- **Process Monitoring**: Automatic detection of screen recording software
+## License
 
-## 🤝 Contributing
+MIT License. See `LICENSE`.
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+## Contact
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🆘 Support
-
-- **Documentation**: Check the `docs/` folder for detailed guides
-- **Issues**: Report bugs on [GitHub Issues](https://github.com/Pang-Dev/PangCrypter/issues)
-- **Discussions**: Join community discussions on [GitHub Discussions](https://github.com/Pang-Dev/PangCrypter/discussions)
-- **Contact**: Reach out at [panghq.com/contact](https://www.panghq.com/contact)
-
-## 🙏 Acknowledgments
-
-- Built with [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) for the GUI
-- Uses [cryptography](https://cryptography.io/) for encryption
-- Inspired by the need for secure, user-friendly encryption tools
-
----
-
-**Enjoy secure and hassle-free encrypted editing with PangCrypter! 🔒✨**
+- https://www.panghq.com/contact
