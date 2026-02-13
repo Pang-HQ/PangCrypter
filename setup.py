@@ -2,8 +2,17 @@
 Setup script for PangCrypter.
 """
 
+import re
 from setuptools import setup, find_packages
-import os
+
+
+def _read_version() -> str:
+    with open("pangcrypter/__init__.py", "r", encoding="utf-8") as f:
+        content = f.read()
+    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+    if not match:
+        raise RuntimeError("Could not determine package version from pangcrypter/__init__.py")
+    return match.group(1)
 
 # Read the README file
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -15,7 +24,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="pangcrypter",
-    version="1.0.0",
+    version=_read_version(),
     author="Pang HQ",
     author_email="",
     description="A secure text editor with encryption capabilities",
