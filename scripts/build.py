@@ -18,8 +18,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Main script entry point - use run.py which handles imports properly
 entry_file = os.path.join(project_root, "run.py")
 
-# PyInstaller build
-PyInstaller.__main__.run([
+pyinstaller_args = [
     entry_file,
     "--name", "PangCrypter",
     "--onefile",
@@ -27,7 +26,6 @@ PyInstaller.__main__.run([
     "--noconfirm",
     "--icon", os.path.join(project_root, "ui", "logo.ico"),
     "--add-data", f"{os.path.join(project_root, 'ui')};ui",
-    "--add-data", f"{os.path.join(project_root, 'preferences.json')};.",
     "--add-data", f"{os.path.join(project_root, 'version.txt')};.",
     "--version-file", os.path.join(project_root, "version.txt"),
     "--hidden-import", "requests",
@@ -37,7 +35,16 @@ PyInstaller.__main__.run([
     "--hidden-import", "pangcrypter.core",
     "--hidden-import", "pangcrypter.ui",
     "--hidden-import", "pangcrypter.utils",
-])
+]
+
+preferences_path = os.path.join(project_root, "preferences.json")
+if os.path.exists(preferences_path):
+    pyinstaller_args.extend(["--add-data", f"{preferences_path};."])
+else:
+    print("ℹ️ preferences.json not found at project root; skipping optional add-data entry")
+
+# PyInstaller build
+PyInstaller.__main__.run(pyinstaller_args)
 
 # Create ZIP distribution with proper folder structure
 import zipfile
