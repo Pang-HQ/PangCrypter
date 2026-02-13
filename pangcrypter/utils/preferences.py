@@ -1,253 +1,638 @@
 # preferences.py
 from dataclasses import dataclass, asdict
 import json
+import logging
+import os
+import platform
+
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QLabel, QSpinBox, QCheckBox,
-    QComboBox, QPushButton, QHBoxLayout
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListView,
+    QPushButton,
+    QSpinBox,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+from PyQt6.QtGui import QGuiApplication
+
+from .mem_guard import (
+    MemGuardMode,
+    default_mem_guard_mode,
+    estimate_scan_time_ms,
+    file_sha256,
+    is_mem_guard_supported,
 )
 
-from .styles import DARK_BG, DARKER_BG, PURPLE, PURPLE_HOVER, TEXT_COLOR, BUTTON_TEXT, WARNING_COLOR
-from PyQt6.QtCore import Qt
+logger = logging.getLogger(__name__)
 
-PREFERENCES_FILE = "preferences.json"
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_CHEVRON_DOWN = os.path.join(_PROJECT_ROOT, "ui", "chevron-down.svg").replace("\\", "/")
+_CHEVRON_UP = os.path.join(_PROJECT_ROOT, "ui", "chevron-up.svg").replace("\\", "/")
+
+
+def _preferences_base_dir() -> str:
+    if os.name == "nt":
+        appdata = os.getenv("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+        return os.path.join(appdata, "PangCrypter")
+
+    if platform.system() == "Darwin":
+        return os.path.join(os.path.expanduser("~/Library/Application Support"), "PangCrypter")
+
+    xdg_config_home = os.getenv("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(xdg_config_home, "PangCrypter")
+
+
+def _preferences_path() -> str:
+    return os.path.join(_preferences_base_dir(), "preferences.json")
+
+
+PREFERENCES_FILE = _preferences_path()
+LEGACY_PREFERENCES_FILE = os.path.join(_PROJECT_ROOT, "preferences.json")
+LEGACY_USER_CONFIG_FILES = [
+    os.path.join(os.getenv("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "pangcrypter", "preferences.json"),
+]
+
+
+def _preferences_stylesheet() -> str:
+    return f"""
+        QDialog {{
+            background-color: #121212;
+            color: #ccc;
+        }}
+        QLabel {{
+            color: #ccc;
+        }}
+        QListWidget {{
+            background-color: #1f1f25;
+            color: #ccc;
+            border: 1px solid #3a3a3a;
+            border-radius: 6px;
+            padding: 4px;
+        }}
+        QListWidget::item {{
+            padding: 8px;
+            border-radius: 4px;
+        }}
+        QListWidget::item:selected {{
+            background-color: #333;
+            color: #eee;
+        }}
+        QCheckBox {{
+            color: #ccc;
+        }}
+
+        /* Base inputs */
+        QLineEdit, QComboBox, QSpinBox {{
+            background-color: #1f1f25;
+            color: #ccc;
+            border: 1px solid #555;
+            border-radius: 6px;
+            min-height: 28px;
+            padding: 3px 8px;
+        }}
+
+        /* Focus */
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
+            border-color: #777;
+            outline: 0;
+        }}
+
+        /* -------- QComboBox -------- */
+        QComboBox {{
+            min-height: 28px;
+            padding: 3px 24px 3px 8px;
+        }}
+        QComboBox::drop-down {{
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 20px;
+            border-left: 1px solid #555;
+            background-color: #2a2a30;
+            border-top-right-radius: 6px;
+            border-bottom-right-radius: 6px;
+        }}
+        QComboBox::down-arrow {{
+            image: url({_CHEVRON_DOWN});
+            width: 10px;
+            height: 10px;
+        }}
+        QComboBox QAbstractItemView,
+        QListView#PreferencesComboPopup {{
+            background-color: #1f1f25;
+            color: #ccc;
+            border: 1px solid #555;
+            outline: 0;
+            selection-background-color: #2f2f38;
+            padding: 4px;
+        }}
+        QComboBox QAbstractItemView::item,
+        QListView#PreferencesComboPopup::item {{
+            min-height: 24px;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }}
+        QComboBox QAbstractItemView::item:hover,
+        QListView#PreferencesComboPopup::item:hover {{
+            background-color: #3a3a46;
+            color: #eee;
+        }}
+        QComboBox QAbstractItemView::item:selected,
+        QListView#PreferencesComboPopup::item:selected {{
+            background-color: #4a4a58;
+            color: #fff;
+        }}
+
+        /* -------- QSpinBox -------- */
+        QSpinBox {{
+            padding-right: 28px;
+        }}
+        QSpinBox::up-button, QSpinBox::down-button {{
+            subcontrol-origin: padding;
+            width: 24px;
+            border-left: 1px solid #555;
+            background-color: #2a2a30;
+        }}
+        QSpinBox::up-button {{
+            subcontrol-position: top right;
+            border-top-right-radius: 6px;
+        }}
+        QSpinBox::down-button {{
+            subcontrol-position: bottom right;
+            border-bottom-right-radius: 6px;
+        }}
+        QSpinBox::up-arrow {{
+            image: url({_CHEVRON_UP});
+            width: 10px;
+            height: 10px;
+        }}
+        QSpinBox::down-arrow {{
+            image: url({_CHEVRON_DOWN});
+            width: 10px;
+            height: 10px;
+        }}
+
+        QPushButton {{
+            background-color: #6B21A8;
+            color: #eee;
+            border: none;
+            border-radius: 5px;
+            padding: 6px 14px;
+            font-weight: 600;
+        }}
+        QPushButton:hover {{
+            background-color: #581C87;
+        }}
+        QListWidget:focus,
+        QPushButton:focus {{
+            outline: 0;
+        }}
+    """
+
+
+class StableComboBox(QComboBox):
+    """ComboBox with an explicit QListView popup for more stable geometry."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        popup_view = QListView(self)
+        popup_view.setObjectName("PreferencesComboPopup")
+        self.setView(popup_view)
+        self.setMaxVisibleItems(12)
+
+    def showPopup(self):
+        super().showPopup()
+        popup = self.view().window()
+        if popup is None:
+            return
+
+        below_left = self.mapToGlobal(self.rect().bottomLeft())
+        screen = QGuiApplication.screenAt(below_left) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        popup_width = max(popup.width(), self.width())
+        popup_height = popup.height()
+
+        max_height_below = max(120, available.bottom() - below_left.y() - 4)
+        popup_height = min(popup_height, max_height_below)
+
+        x = min(max(available.left(), below_left.x()), max(available.left(), available.right() - popup_width))
+        y = min(max(available.top(), below_left.y()), max(available.top(), available.bottom() - popup_height))
+
+        popup.resize(popup_width, popup_height)
+        popup.move(x, y)
+
 
 @dataclass
 class Preferences:
     recording_cooldown: int = 30
     screen_recording_hide_enabled: bool = True
     tab_out_hide_enabled: bool = True
-    tab_setting: str = "spaces4"  # e.g. "spaces4" or "tab"
+    tab_setting: str = "spaces4"
+    session_cache_enabled: bool = True
+    session_reauth_on_focus_loss: bool = True
+    session_reauth_minutes: int = 2
+    session_infocus_inactivity_reauth_enabled: bool = True
+    session_infocus_inactivity_minutes: int = 5
+    mem_guard_mode: str = default_mem_guard_mode()
+    mem_guard_whitelist: list[dict | str] = None
+    auto_delete_panic_files: bool = True
+    mem_guard_scan_interval_ms: int = 50
+    mem_guard_pid_cache_cap: int = 128
+
+    def __post_init__(self):
+        if self.mem_guard_whitelist is None:
+            self.mem_guard_whitelist = []
+
+    def normalize(self):
+        self.session_reauth_minutes = max(1, min(5, int(self.session_reauth_minutes)))
+        self.session_infocus_inactivity_minutes = max(
+            self.session_reauth_minutes,
+            min(120, max(5, int(self.session_infocus_inactivity_minutes))),
+        )
+
+        if not self.session_cache_enabled or not is_mem_guard_supported():
+            self.mem_guard_mode = MemGuardMode.OFF.value
+
+        self.mem_guard_scan_interval_ms = max(20, min(200, int(self.mem_guard_scan_interval_ms)))
+        self.mem_guard_pid_cache_cap = max(32, min(512, int(self.mem_guard_pid_cache_cap)))
+
+        valid_modes = {m.value for m in MemGuardMode}
+        if self.mem_guard_mode not in valid_modes:
+            self.mem_guard_mode = default_mem_guard_mode()
+
+        if not isinstance(self.mem_guard_whitelist, list):
+            self.mem_guard_whitelist = []
+
+        normalized_whitelist: list[dict] = []
+        for item in self.mem_guard_whitelist:
+            if isinstance(item, str) and item.strip():
+                normalized_whitelist.append({"path": os.path.abspath(item), "sha256": ""})
+            elif isinstance(item, dict):
+                path = str(item.get("path", "")).strip()
+                if path:
+                    normalized_whitelist.append(
+                        {
+                            "path": os.path.abspath(path),
+                            "sha256": str(item.get("sha256", "")).strip().lower(),
+                        }
+                    )
+
+        deduped: dict[str, dict] = {}
+        for entry in normalized_whitelist:
+            canonical_path = os.path.normcase(os.path.abspath(entry["path"]))
+            sha = str(entry.get("sha256", "")).strip().lower()
+            existing = deduped.get(canonical_path)
+            if existing is None:
+                deduped[canonical_path] = {"path": entry["path"], "sha256": sha}
+                continue
+
+            existing_sha = str(existing.get("sha256", "")).strip().lower()
+            if not existing_sha and sha:
+                deduped[canonical_path] = {"path": entry["path"], "sha256": sha}
+            elif existing_sha and sha and existing_sha != sha:
+                logger.warning(
+                    "Conflicting mem-guard whitelist hashes for path '%s'; keeping existing hash",
+                    entry["path"],
+                )
+
+        self.mem_guard_whitelist = list(deduped.values())
 
     def load_preferences(self):
+        path = PREFERENCES_FILE
+        legacy_candidates = [LEGACY_PREFERENCES_FILE] + LEGACY_USER_CONFIG_FILES
+        if not os.path.exists(path):
+            for legacy_path in legacy_candidates:
+                if not os.path.exists(legacy_path):
+                    continue
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    if os.name != "nt":
+                        os.chmod(os.path.dirname(path), 0o700)
+                    with open(legacy_path, "r", encoding="utf-8") as src, open(path, "w", encoding="utf-8") as dst:
+                        dst.write(src.read())
+                    logger.info("Migrated legacy preferences file to user config directory: %s", path)
+                except (OSError, ValueError) as e:
+                    logger.warning("Could not migrate legacy preferences file: %s", e)
+                break
+
         try:
-            with open(PREFERENCES_FILE, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                if "cache_passwords_enabled" in data and "session_cache_enabled" not in data:
+                    data["session_cache_enabled"] = bool(data.get("cache_passwords_enabled"))
+                if "cache_secrets_enabled" in data and "session_cache_enabled" not in data:
+                    data["session_cache_enabled"] = bool(data.get("cache_secrets_enabled"))
+
                 for key, value in data.items():
-                    setattr(self, key, value)
-        except Exception:
-            # Could not load, use defaults
-            pass
+                    if hasattr(self, key):
+                        setattr(self, key, value)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning("Could not load preferences, using defaults: %s", e)
+        finally:
+            self.normalize()
 
     def save_preferences(self):
-        with open(PREFERENCES_FILE, "w") as f:
+        self.normalize()
+        os.makedirs(os.path.dirname(PREFERENCES_FILE), exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(os.path.dirname(PREFERENCES_FILE), 0o700)
+            except OSError as e:
+                logger.debug("Could not apply strict permissions to preferences dir: %s", e)
+
+        temp_path = f"{PREFERENCES_FILE}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(asdict(self), f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, PREFERENCES_FILE)
+
 
 PangPreferences = Preferences()
 PangPreferences.load_preferences()
+
 
 class PreferencesDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Preferences")
-        self.resize(480, 400)
-        self.setStyleSheet(f"background-color: {DARK_BG};")
+        self.resize(780, 560)
+        self.setStyleSheet(_preferences_stylesheet())
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(14)
+        root = QVBoxLayout(self)
+        body = QHBoxLayout()
+        root.addLayout(body, 1)
 
-        # Styles
-        label_style = f"""
-            color: {TEXT_COLOR};
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            font-size: 13px;
-            margin-bottom: 6px;
-        """
+        self.sidebar = QListWidget()
+        self.sidebar.setFixedWidth(170)
+        self.sidebar.addItems(["General", "Session", "Memory Guard", "Editor"])
+        body.addWidget(self.sidebar)
 
-        checkbox_style = f"""
-            QCheckBox {{
-                spacing: 5px;
-                color: {TEXT_COLOR};
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                font-size: 13px;
-            }}
-            QCheckBox::indicator {{
-                width: 14px;
-                height: 14px;
-                border-radius: 3px;  /* less round */
-                border: 1.5px solid {PURPLE};
-                background: {DARKER_BG};
-            }}
-            QCheckBox::indicator:checked {{
-                background-color: {PURPLE};
-                border: 1.5px solid {PURPLE};
-            }}
-            QCheckBox::indicator:checked:hover {{
-                background-color: {PURPLE_HOVER};
-                border: 1.5px solid {PURPLE_HOVER};
-            }}
-            QCheckBox::indicator:hover {{
-                border: 1.5px solid {PURPLE_HOVER};
-            }}
-        """
+        self.pages = QStackedWidget()
+        body.addWidget(self.pages, 1)
 
-        spinbox_style = f"""
-            QSpinBox {{
-                background-color: {DARKER_BG};
-                border: 1px solid {PURPLE};
-                border-radius: 4px;
-                padding: 4px 8px;
-                color: {TEXT_COLOR};
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                font-size: 13px;
-                min-height: 24px;
-            }}
-            QSpinBox::up-button {{
-                width: 12px;
-                height: 16px;
-                border: none;
-                margin-right: 10px;
-                image: url(ui/dropup.svg);
-            }}
-            QSpinBox::down-button {{
-                width: 12px;
-                height: 16px;
-                border: none;
-                margin-right: 10px;
-                image: url(ui/dropdown.svg);
-            }}
-        """
+        self.pages.addWidget(self._build_general_page())
+        self.pages.addWidget(self._build_session_page())
+        self.pages.addWidget(self._build_mem_guard_page())
+        self.pages.addWidget(self._build_editor_page())
 
-        tab_type_style = f"""
-            QComboBox {{
-                background-color: {DARKER_BG};
-                border: 1px solid {PURPLE};
-                border-radius: 4px;  /* less round */
-                padding: 4px 8px;
-                color: {TEXT_COLOR};
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                font-size: 13px;
-                min-height: 24px;
-            }}
-            QComboBox::drop-down {{
-                border: none;
-                width: 20px;
-                subcontrol-origin: padding;
-                subcontrol-position: top right;
-            }}
-            QComboBox::down-arrow {{
-                image: url(ui/dropdown.svg);
-                width: 12px;
-                height: 16px;
-                margin-right: 10px;
-            }}
-        """
+        self.sidebar.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.sidebar.setCurrentRow(0)
 
-        warning_style = f"""
-            color: {WARNING_COLOR};
-            font-weight: 600;
-            font-size: 11px;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin-top: 4px;
-        """
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(ok_btn)
+        buttons.addWidget(cancel_btn)
+        root.addLayout(buttons)
 
-        button_style = f"""
-            padding: 6px 16px;
-            font-weight: 600;
-            background-color: {PURPLE};
-            border: none;
-            border-radius: 6px;
-            color: {BUTTON_TEXT};
-            min-width: 80px;
-        """
+        self._update_mem_guard_controls()
 
-        # --- Cooldown ---
-        cooldown_label = QLabel("Cooldown for recording sessions (seconds):")
-        cooldown_label.setStyleSheet(label_style)
-        layout.addWidget(cooldown_label)
-
+    def _build_general_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("Cooldown for recording sessions (seconds):"))
         self.cooldown_spin = QSpinBox()
         self.cooldown_spin.setRange(1, 300)
         self.cooldown_spin.setValue(PangPreferences.recording_cooldown)
-        self.cooldown_spin.setStyleSheet(spinbox_style)
         layout.addWidget(self.cooldown_spin)
 
-        # --- Checkboxes ---
         self.disable_recording_hide = QCheckBox("Disable hiding editor when recording detected")
         self.disable_recording_hide.setChecked(not PangPreferences.screen_recording_hide_enabled)
-        self.disable_recording_hide.setStyleSheet(checkbox_style)
         layout.addWidget(self.disable_recording_hide)
 
         self.disable_tabbing_hide = QCheckBox("Disable hiding editor on tab out (unsafe)")
         self.disable_tabbing_hide.setChecked(not PangPreferences.tab_out_hide_enabled)
-        self.disable_tabbing_hide.setStyleSheet(checkbox_style)
         layout.addWidget(self.disable_tabbing_hide)
 
-        warning_label = QLabel("Warning: Disabling tab out hiding can be unsafe.")
-        warning_label.setStyleSheet(warning_style)
-        layout.addWidget(warning_label)
+        self.auto_delete_panic = QCheckBox("Auto-delete .panic.enc after successful restore")
+        self.auto_delete_panic.setChecked(PangPreferences.auto_delete_panic_files)
+        layout.addWidget(self.auto_delete_panic)
+        layout.addStretch()
+        return page
 
-        # --- Tab character ---
-        tab_label = QLabel("Tab character settings:")
-        tab_label.setStyleSheet(label_style)
-        layout.addWidget(tab_label)
+    def _build_session_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.enable_session_cache = QCheckBox("Enable session caching (required for mem guard + autosave)")
+        self.enable_session_cache.setChecked(PangPreferences.session_cache_enabled)
+        self.enable_session_cache.toggled.connect(self._update_mem_guard_controls)
+        layout.addWidget(self.enable_session_cache)
 
-        self.tab_type_combo = QComboBox()
+        self.session_reauth_on_focus_loss = QCheckBox("Require re-auth after app is out of focus")
+        self.session_reauth_on_focus_loss.setChecked(PangPreferences.session_reauth_on_focus_loss)
+        layout.addWidget(self.session_reauth_on_focus_loss)
+
+        layout.addWidget(QLabel("Re-auth timeout after focus loss (minutes):"))
+        self.reauth_minutes_spin = QSpinBox()
+        self.reauth_minutes_spin.setRange(1, 5)
+        self.reauth_minutes_spin.setValue(PangPreferences.session_reauth_minutes)
+        layout.addWidget(self.reauth_minutes_spin)
+
+        self.infocus_reauth_enabled = QCheckBox("Require re-auth after in-focus inactivity")
+        self.infocus_reauth_enabled.setChecked(PangPreferences.session_infocus_inactivity_reauth_enabled)
+        layout.addWidget(self.infocus_reauth_enabled)
+
+        layout.addWidget(QLabel("In-focus inactivity timeout (minutes):"))
+        self.infocus_minutes_spin = QSpinBox()
+        self.infocus_minutes_spin.setRange(5, 120)
+        self.infocus_minutes_spin.setValue(PangPreferences.session_infocus_inactivity_minutes)
+        layout.addWidget(self.infocus_minutes_spin)
+        layout.addStretch()
+        return page
+
+    def _build_mem_guard_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        layout.addWidget(QLabel("Memory guard mode:"))
+        self.mem_guard_combo = StableComboBox()
+        self.mem_guard_combo.addItem("Off", MemGuardMode.OFF.value)
+        self.mem_guard_combo.addItem("Normal (recommended)", MemGuardMode.NORMAL.value)
+        self.mem_guard_combo.addItem("Ultra aggressive (not recommended)", MemGuardMode.ULTRA_AGGRESSIVE.value)
+        self.mem_guard_combo.setCurrentIndex(max(0, self.mem_guard_combo.findData(PangPreferences.mem_guard_mode)))
+        layout.addWidget(self.mem_guard_combo)
+
+        layout.addWidget(QLabel("Memory guard scan interval (ms):"))
+        self.scan_interval_spin = QSpinBox()
+        self.scan_interval_spin.setRange(20, 200)
+        self.scan_interval_spin.setValue(PangPreferences.mem_guard_scan_interval_ms)
+        layout.addWidget(self.scan_interval_spin)
+
+        layout.addWidget(QLabel("PID handle cache cap:"))
+        self.cache_cap_spin = QSpinBox()
+        self.cache_cap_spin.setRange(32, 512)
+        self.cache_cap_spin.setSingleStep(32)
+        self.cache_cap_spin.setValue(PangPreferences.mem_guard_pid_cache_cap)
+        layout.addWidget(self.cache_cap_spin)
+
+        estimate_row = QHBoxLayout()
+        self.scan_estimate_label = QLabel("Expected scan time: not sampled")
+        self.scan_estimate_button = QPushButton("Estimate (25 scans)")
+        self.scan_estimate_button.clicked.connect(self._estimate_scan_time)
+        estimate_row.addWidget(self.scan_estimate_label, 1)
+        estimate_row.addWidget(self.scan_estimate_button)
+        layout.addLayout(estimate_row)
+
+        self.mem_guard_info = QLabel("")
+        layout.addWidget(self.mem_guard_info)
+
+        layout.addWidget(QLabel("Memory guard whitelist (executable paths):"))
+        self.whitelist_list = QListWidget()
+        for item in PangPreferences.mem_guard_whitelist:
+            if isinstance(item, dict):
+                p = item.get("path", "")
+                s = item.get("sha256", "")
+                self.whitelist_list.addItem(f"{p} | {s}" if s else p)
+        layout.addWidget(self.whitelist_list)
+
+        wl_row = QHBoxLayout()
+        self.whitelist_add_btn = QPushButton("Add executable")
+        self.whitelist_add_btn.clicked.connect(self._add_whitelist_entry)
+        self.whitelist_remove_btn = QPushButton("Remove selected")
+        self.whitelist_remove_btn.clicked.connect(self._remove_whitelist_entry)
+        wl_row.addWidget(self.whitelist_add_btn)
+        wl_row.addWidget(self.whitelist_remove_btn)
+        layout.addLayout(wl_row)
+
+        layout.addStretch()
+        return page
+
+    def _build_editor_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        layout.addWidget(QLabel("Tab character settings:"))
+        self.tab_type_combo = StableComboBox()
         self.tab_type_combo.addItems(["Spaces", "Tab character"])
-        self.tab_type_combo.setStyleSheet(tab_type_style)
-        if PangPreferences.tab_setting.startswith("tab"):
-            self.tab_type_combo.setCurrentIndex(1)
-        else:
-            self.tab_type_combo.setCurrentIndex(0)
+        self.tab_type_combo.setCurrentIndex(1 if PangPreferences.tab_setting.startswith("tab") else 0)
         layout.addWidget(self.tab_type_combo)
 
-        spaces_label = QLabel("Number of spaces per indent:")
-        spaces_label.setStyleSheet(label_style)
-        layout.addWidget(spaces_label)
-
+        self.spaces_label = QLabel("Number of spaces per indent:")
+        layout.addWidget(self.spaces_label)
         self.spaces_spin = QSpinBox()
         self.spaces_spin.setRange(1, 16)
         if PangPreferences.tab_setting.startswith("spaces"):
             try:
-                n_spaces = int(PangPreferences.tab_setting[6:])
-            except Exception:
-                n_spaces = 4
+                self.spaces_spin.setValue(int(PangPreferences.tab_setting[6:]))
+            except ValueError:
+                self.spaces_spin.setValue(4)
         else:
-            n_spaces = 4
-        self.spaces_spin.setValue(n_spaces)
-        self.spaces_spin.setStyleSheet(spinbox_style)
+            self.spaces_spin.setValue(4)
         layout.addWidget(self.spaces_spin)
+        self.tab_type_combo.currentIndexChanged.connect(self._update_spaces_visibility)
+        self._update_spaces_visibility(self.tab_type_combo.currentIndex())
 
-        def update_spaces_spin_visibility(index):
-            visible = index == 0
-            self.spaces_spin.setVisible(visible)
-            spaces_label.setVisible(visible)
-
-        self.tab_type_combo.currentIndexChanged.connect(update_spaces_spin_visibility)
-        update_spaces_spin_visibility(self.tab_type_combo.currentIndex())
-
-        # --- Buttons ---
-        buttons = QHBoxLayout()
-        buttons.setSpacing(12)
-        buttons.addStretch()
-
-        ok_btn = QPushButton("OK")
-        ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        ok_btn.setStyleSheet(button_style)
-        ok_btn.clicked.connect(self.accept)
-        buttons.addWidget(ok_btn)
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        cancel_btn.setStyleSheet(button_style)
-        cancel_btn.clicked.connect(self.reject)
-        buttons.addWidget(cancel_btn)
-
-        layout.addLayout(buttons)
-
-        # ADD THIS TO KEEP EVERYTHING AT THE TOP:
         layout.addStretch()
+        return page
 
-        self.setLayout(layout)
+    def _update_spaces_visibility(self, index: int):
+        is_spaces = index == 0
+        self.spaces_label.setVisible(is_spaces)
+        self.spaces_spin.setVisible(is_spaces)
+
+    def _estimate_scan_time(self):
+        if not is_mem_guard_supported() or not self.enable_session_cache.isChecked():
+            self.scan_estimate_label.setText("Expected scan time: unavailable")
+            return
+        self.scan_estimate_label.setText("Expected scan time: sampling...")
+        self.repaint()
+        avg = estimate_scan_time_ms(
+            samples=25,
+            max_entries=0,
+            cache_cap=self.cache_cap_spin.value(),
+            inter_scan_delay_ms=self.scan_interval_spin.value(),
+        )
+        if avg is None:
+            self.scan_estimate_label.setText("Expected scan time: unavailable")
+        else:
+            self.scan_estimate_label.setText(
+                f"Expected scan time: ~{avg:.2f} ms (25-scan avg, interval delay excluded)"
+            )
+
+    def _update_mem_guard_controls(self):
+        supported = is_mem_guard_supported()
+        session_ok = self.enable_session_cache.isChecked()
+        enabled = supported and session_ok
+
+        for w in (
+            self.mem_guard_combo,
+            self.scan_interval_spin,
+            self.cache_cap_spin,
+            self.scan_estimate_button,
+            self.whitelist_list,
+            self.whitelist_add_btn,
+            self.whitelist_remove_btn,
+        ):
+            w.setEnabled(enabled)
+
+        if not supported:
+            self.mem_guard_info.setText("Memory guard is available on Windows only.")
+        elif not session_ok:
+            self.mem_guard_info.setText("Enable session caching to use memory guard.")
+            self.mem_guard_combo.setCurrentIndex(self.mem_guard_combo.findData(MemGuardMode.OFF.value))
+        else:
+            self.mem_guard_info.setText("Memory guard will monitor suspicious process memory access.")
+
+    def _add_whitelist_entry(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select executable to whitelist")
+        if not path:
+            return
+        path = os.path.abspath(path)
+        digest = file_sha256(path)
+        display = f"{path} | {digest}" if digest else path
+        existing = {self.whitelist_list.item(i).text() for i in range(self.whitelist_list.count())}
+        if display not in existing:
+            self.whitelist_list.addItem(display)
+
+    def _remove_whitelist_entry(self):
+        row = self.whitelist_list.currentRow()
+        if row >= 0:
+            self.whitelist_list.takeItem(row)
 
     def accept(self):
         PangPreferences.recording_cooldown = self.cooldown_spin.value()
         PangPreferences.screen_recording_hide_enabled = not self.disable_recording_hide.isChecked()
         PangPreferences.tab_out_hide_enabled = not self.disable_tabbing_hide.isChecked()
+        PangPreferences.session_cache_enabled = self.enable_session_cache.isChecked()
+        PangPreferences.session_reauth_on_focus_loss = self.session_reauth_on_focus_loss.isChecked()
+        PangPreferences.session_reauth_minutes = self.reauth_minutes_spin.value()
+        PangPreferences.session_infocus_inactivity_reauth_enabled = self.infocus_reauth_enabled.isChecked()
+        PangPreferences.session_infocus_inactivity_minutes = self.infocus_minutes_spin.value()
+        PangPreferences.auto_delete_panic_files = self.auto_delete_panic.isChecked()
+
+        PangPreferences.mem_guard_scan_interval_ms = self.scan_interval_spin.value()
+        PangPreferences.mem_guard_pid_cache_cap = self.cache_cap_spin.value()
+        requested_mode = self.mem_guard_combo.currentData()
+        if not PangPreferences.session_cache_enabled or not is_mem_guard_supported():
+            PangPreferences.mem_guard_mode = MemGuardMode.OFF.value
+        else:
+            PangPreferences.mem_guard_mode = requested_mode
+
+        whitelist_items: list[dict] = []
+        for i in range(self.whitelist_list.count()):
+            raw = self.whitelist_list.item(i).text()
+            if " | " in raw:
+                path, sha = raw.split(" | ", 1)
+            else:
+                path, sha = raw, ""
+            whitelist_items.append({"path": path.strip(), "sha256": sha.strip().lower()})
+        PangPreferences.mem_guard_whitelist = whitelist_items
 
         if self.tab_type_combo.currentIndex() == 0:
-            n = self.spaces_spin.value()
-            PangPreferences.tab_setting = f"spaces{n}"
+            PangPreferences.tab_setting = f"spaces{self.spaces_spin.value()}"
         else:
             PangPreferences.tab_setting = "tab"
 
