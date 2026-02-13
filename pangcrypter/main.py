@@ -39,6 +39,7 @@ from .utils.mem_guard import (
     MemGuardChecker,
     MemGuardMode,
     MemGuardFinding,
+    file_sha256,
     is_mem_guard_supported,
 )
 
@@ -998,6 +999,37 @@ class MainWindow(QMainWindow):
             self.clear_cached_secrets()
         self._focus_lost_at = None
 
+    def _ensure_mem_guard_self_whitelist(self) -> None:
+        """Auto-whitelist the frozen executable to avoid self-detection noise."""
+        if not getattr(sys, "frozen", False):
+            return
+
+        exe_path = os.path.abspath(sys.executable)
+        if not exe_path or not os.path.exists(exe_path):
+            return
+
+        digest = file_sha256(exe_path)
+        entries = PangPreferences.mem_guard_whitelist
+        changed = False
+
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            if os.path.normcase(os.path.abspath(str(item.get("path", "")))) != os.path.normcase(exe_path):
+                continue
+
+            existing_sha = str(item.get("sha256", "")).strip().lower()
+            if digest and existing_sha != digest.lower():
+                item["sha256"] = digest.lower()
+                changed = True
+            return
+
+        entries.append({"path": exe_path, "sha256": digest.lower() if digest else ""})
+        changed = True
+
+        if changed:
+            PangPreferences.save_preferences()
+
     def _configure_mem_guard(self):
         if self._mem_guard_disabled_until_restart:
             return
@@ -1018,6 +1050,8 @@ class MainWindow(QMainWindow):
             mode = MemGuardMode(mode_value)
         except ValueError:
             return
+
+        self._ensure_mem_guard_self_whitelist()
 
         self.mem_guard_thread = QThread()
         self.mem_guard_checker = MemGuardChecker(

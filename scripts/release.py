@@ -15,6 +15,7 @@ Flow:
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import os
 import re
@@ -23,6 +24,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -130,10 +132,46 @@ def write_checksum(zip_path: Path) -> Path:
     return checksum_path
 
 
-def sign_with_minisign(zip_path: Path, minisign_secret_key: Path) -> Path:
+def resolve_binary(binary_name: str, env_override_key: str = "") -> str:
+    env_path = os.getenv(env_override_key, "").strip() if env_override_key else ""
+    candidates = [env_path] if env_path else []
+
+    discovered = shutil.which(binary_name)
+    if discovered:
+        candidates.append(discovered)
+
+    if os.name == "nt":
+        if binary_name.lower() == "gh":
+            candidates.extend(
+                [
+                    r"C:\Program Files\GitHub CLI\gh.exe",
+                    r"C:\Program Files (x86)\GitHub CLI\gh.exe",
+                ]
+            )
+        elif binary_name.lower() == "minisign":
+            candidates.extend(
+                [
+                    r"C:\Program Files\minisign\minisign.exe",
+                    r"C:\Program Files (x86)\minisign\minisign.exe",
+                ]
+            )
+
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(Path(candidate))
+
+    raise RuntimeError(f"Could not locate '{binary_name}' executable")
+
+
+def sign_with_minisign(
+    zip_path: Path,
+    minisign_secret_key: Path,
+    minisign_bin: str,
+    minisign_password: Optional[str] = None,
+) -> Path:
     signature_path = zip_path.with_suffix(zip_path.suffix + MINISIG_SUFFIX)
     cmd = [
-        "minisign",
+        minisign_bin,
         "-S",
         "-s",
         str(minisign_secret_key),
@@ -142,13 +180,60 @@ def sign_with_minisign(zip_path: Path, minisign_secret_key: Path) -> Path:
         "-x",
         str(signature_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    stdin_payload = None
+    if minisign_password is not None:
+        stdin_payload = f"{minisign_password}\n"
+
+    result = subprocess.run(cmd, capture_output=True, text=True, input=stdin_payload)
     if result.returncode != 0:
         raise RuntimeError(
             "minisign signing failed. Ensure minisign is installed and key is valid.\n"
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
     return signature_path
+
+
+def verify_minisign_signature(
+    zip_path: Path,
+    signature_path: Path,
+    minisign_bin: str,
+    minisign_public_key: Optional[Path],
+) -> None:
+    if minisign_public_key is None:
+        return
+    if not minisign_public_key.exists():
+        raise RuntimeError(f"minisign public key not found: {minisign_public_key}")
+
+    # minisign pub files often contain a comment line plus the key line.
+    # Extract the first line that looks like a minisign public key payload.
+    pubkey_text = minisign_public_key.read_text(encoding="utf-8")
+    pubkey = next(
+        (
+            ln.strip()
+            for ln in pubkey_text.splitlines()
+            if ln.strip() and re.match(r"^RW[A-Za-z0-9+/= ]+$", ln.strip())
+        ),
+        "",
+    )
+    if not pubkey:
+        raise RuntimeError(f"minisign public key file is empty: {minisign_public_key}")
+
+    cmd = [
+        minisign_bin,
+        "-V",
+        "-m",
+        str(zip_path),
+        "-x",
+        str(signature_path),
+        "-P",
+        pubkey,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "minisign verification failed after signing.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
 
 
 def write_release_notes(version: str, checksum: str) -> Path:
@@ -166,11 +251,22 @@ def write_release_notes(version: str, checksum: str) -> Path:
 
 def open_in_vscode(path: Path) -> None:
     print(f"\n▶ Opening release notes in VS Code: {path}")
-    subprocess.run(["code", str(path)])
+    code_bin = shutil.which("code")
+    if not code_bin:
+        print("ℹ️ VS Code CLI ('code') not found on PATH; edit release notes manually.")
+        return
+
+    try:
+        result = subprocess.run([code_bin, str(path)], capture_output=True, text=True)
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            print(f"ℹ️ Could not open VS Code automatically (continuing): {msg}")
+    except OSError as e:
+        print(f"ℹ️ Could not open VS Code automatically (continuing): {e}")
 
 
-def ensure_gh_cli() -> None:
-    result = subprocess.run(["gh", "--version"], capture_output=True, text=True)
+def ensure_gh_cli(gh_bin: str) -> None:
+    result = subprocess.run([gh_bin, "--version"], capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
             "GitHub CLI (gh) not found. Install from https://cli.github.com/ and authenticate via 'gh auth login'."
@@ -178,6 +274,7 @@ def ensure_gh_cli() -> None:
 
 
 def publish_release(
+    gh_bin: str,
     version: str,
     zip_path: Path,
     checksum_path: Path,
@@ -188,7 +285,7 @@ def publish_release(
     tag = f"v{version}"
     title = version
     cmd = [
-        "gh", "release", "create", tag,
+        gh_bin, "release", "create", tag,
         str(zip_path),
         str(checksum_path),
         str(minisig_path),
@@ -204,6 +301,22 @@ def publish_release(
         raise RuntimeError("GitHub release publish failed.")
 
 
+def print_release_summary(gh_bin: str, version: str) -> None:
+    tag = f"v{version}"
+    summary_cmd = [
+        gh_bin,
+        "release",
+        "view",
+        tag,
+        "--json",
+        "url,tagName,isDraft,isPrerelease,assets",
+        "--jq",
+        "{url:.url,tag:.tagName,draft:.isDraft,prerelease:.isPrerelease,assets:[.assets[].name]}",
+    ]
+    print("\n▶ Release summary:")
+    subprocess.run(summary_cmd)
+
+
 def confirm_publish() -> bool:
     confirm = input("\nPublish GitHub release now? [Y/N]: ").strip().lower()
     return confirm == "y"
@@ -215,6 +328,14 @@ def main() -> int:
     parser.add_argument(
         "--minisign-key",
         help="Path to minisign secret key. If omitted, uses PANGCRYPTER_MINISIGN_SECRET_KEY env var.",
+    )
+    parser.add_argument(
+        "--minisign-pubkey",
+        help="Path to minisign public key for post-sign verification (default: minisign.pub in repo root).",
+    )
+    parser.add_argument(
+        "--minisign-password",
+        help="Password for encrypted minisign secret key (or set PANGCRYPTER_MINISIGN_PASSWORD).",
     )
     args = parser.parse_args()
 
@@ -237,23 +358,47 @@ def main() -> int:
 
         checksum_path = write_checksum(zip_path)
         checksum_value = sha256_file(zip_path)
+
+        minisign_bin = resolve_binary("minisign", env_override_key="PANGCRYPTER_MINISIGN_PATH")
         minisign_key = args.minisign_key or os.getenv("PANGCRYPTER_MINISIGN_SECRET_KEY")
         if not minisign_key:
             raise RuntimeError(
                 "Missing minisign secret key. Pass --minisign-key or set PANGCRYPTER_MINISIGN_SECRET_KEY."
             )
-        minisig_path = sign_with_minisign(zip_path, Path(minisign_key))
+        minisign_password = args.minisign_password
+        if minisign_password is None:
+            minisign_password = os.getenv("PANGCRYPTER_MINISIGN_PASSWORD")
+        if minisign_password is None:
+            minisign_password = getpass.getpass("minisign key password (leave blank for unencrypted key): ")
+
+        minisig_path = sign_with_minisign(
+            zip_path,
+            Path(minisign_key),
+            minisign_bin=minisign_bin,
+            minisign_password=minisign_password,
+        )
+
+        minisign_pubkey = Path(args.minisign_pubkey) if args.minisign_pubkey else (ROOT / "minisign.pub")
+        verify_minisign_signature(
+            zip_path,
+            minisig_path,
+            minisign_bin=minisign_bin,
+            minisign_public_key=minisign_pubkey,
+        )
+
         notes_path = write_release_notes(version, checksum_value)
 
         open_in_vscode(notes_path)
         input("\nPress Enter to continue after editing release notes...")
 
-        ensure_gh_cli()
+        gh_bin = resolve_binary("gh", env_override_key="PANGCRYPTER_GH_PATH")
+        ensure_gh_cli(gh_bin)
 
         if not confirm_publish():
             raise RuntimeError("Publish cancelled by user.")
 
-        publish_release(version, zip_path, checksum_path, minisig_path, notes_path, args.fullpublish)
+        publish_release(gh_bin, version, zip_path, checksum_path, minisig_path, notes_path, args.fullpublish)
+        print_release_summary(gh_bin, version)
 
         print("\n✅ Release published successfully.")
         return 0

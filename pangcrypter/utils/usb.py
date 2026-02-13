@@ -1,10 +1,10 @@
 import logging
 import os
 import platform
-import subprocess
+import ctypes
+from ctypes import wintypes
 
 from ..ui.messagebox import PangMessageBox
-from .system_binaries import resolve_trusted_binary
 
 logger = logging.getLogger(__name__)
 
@@ -15,22 +15,27 @@ def list_usb_drives() -> list[str]:
 
     if system == "Windows":
         try:
-            wmic_binary = resolve_trusted_binary("wmic", [r"C:\Windows\System32\wbem\wmic.exe"])
-            result = subprocess.run(
-                [wmic_binary, "logicaldisk", "where", "drivetype=2", "get", "deviceid"],
-                capture_output=True,
-                text=True,
-                check=True,
-                shell=False,
-            )
-            output = result.stdout
-            for line in output.strip().splitlines():
-                line = line.strip()
-                if line and line != "DeviceID":
-                    drive_path = line + "\\"
-                    if os.access(drive_path, os.W_OK):
-                        drives.append(drive_path)
-        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            get_logical_drives = kernel32.GetLogicalDrives
+            get_logical_drives.restype = wintypes.DWORD
+
+            get_drive_type = kernel32.GetDriveTypeW
+            get_drive_type.argtypes = [wintypes.LPCWSTR]
+            get_drive_type.restype = wintypes.UINT
+
+            DRIVE_REMOVABLE = 2
+
+            mask = int(get_logical_drives())
+            for idx in range(26):
+                if not (mask & (1 << idx)):
+                    continue
+
+                drive_letter = chr(ord("A") + idx)
+                drive_path = f"{drive_letter}:\\"
+                drive_type = int(get_drive_type(drive_path))
+                if drive_type == DRIVE_REMOVABLE and os.access(drive_path, os.W_OK):
+                    drives.append(drive_path)
+        except (OSError, ValueError) as e:
             logger.warning("Windows USB detection failed: %s", e)
 
     elif system == "Linux":

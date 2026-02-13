@@ -6,6 +6,8 @@ import platform
 import plistlib
 import stat
 import subprocess
+import ctypes
+from ctypes import wintypes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .encrypt import EncryptModeType
@@ -250,7 +252,7 @@ def get_drive_hardware_id(drive_path: str) -> bytes:
     Returns 32-byte hash to be used as HKDF salt.
 
     Improvements:
-    - Windows: prefer WMI volume serial via 'wmic' or PowerShell.
+    - Windows: query volume serial via WinAPI (no subprocess/console spawn).
     - macOS: parse diskutil plist output.
     - Linux: use blkid.
     """
@@ -261,27 +263,56 @@ def get_drive_hardware_id(drive_path: str) -> bytes:
 
     system = platform.system()
     if system == "Windows":
-        # Prefer WMI query for volume serial number
+        # Prefer WinAPI volume serial query to avoid spawning console subprocesses
         try:
             drive_letter = drive_path.rstrip("\\/")[:2]  # e.g. "F:"
-            wmic_binary = resolve_trusted_binary("wmic", [r"C:\Windows\System32\wbem\wmic.exe"])
-            # Use wmic logicaldisk get VolumeSerialNumber
-            cmd = [wmic_binary, 'logicaldisk', 'where', f"DeviceID='{drive_letter}'", 'get', 'VolumeSerialNumber', '/value']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            # Output like: VolumeSerialNumber=XXXXXX
-            for line in result.stdout.splitlines():
-                if line.startswith("VolumeSerialNumber="):
-                    serial = line.strip().split("=", 1)[1]
-                    if serial:
-                        cleaned = serial.replace("-", "").strip()
-                        try:
-                            serial_bytes = bytes.fromhex(cleaned)
-                        except ValueError:
-                            serial_bytes = cleaned.encode("utf-8")
-                        hwid = hashlib.sha256(serial_bytes).digest()
-                        _HWID_CACHE[normalized_drive] = hwid
-                        return hwid
-        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            if len(drive_letter) != 2 or drive_letter[1] != ":":
+                raise ValueError(f"Invalid Windows drive path: {drive_path}")
+            root_path = f"{drive_letter}\\"
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            get_volume_information = kernel32.GetVolumeInformationW
+            get_volume_information.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.LPWSTR,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(wintypes.DWORD),
+                wintypes.LPWSTR,
+                wintypes.DWORD,
+            ]
+            get_volume_information.restype = wintypes.BOOL
+
+            serial_number = wintypes.DWORD(0)
+            max_component_len = wintypes.DWORD(0)
+            file_system_flags = wintypes.DWORD(0)
+            # We only need serial_number, so keep volume/fs-name buffers null.
+            ok = bool(
+                get_volume_information(
+                    root_path,
+                    None,
+                    0,
+                    ctypes.byref(serial_number),
+                    ctypes.byref(max_component_len),
+                    ctypes.byref(file_system_flags),
+                    None,
+                    0,
+                )
+            )
+            if not ok:
+                err = ctypes.get_last_error()
+                raise OSError(err, f"GetVolumeInformationW failed for {root_path}")
+
+            serial_int = int(serial_number.value)
+            if serial_int == 0:
+                raise ValueError(f"Invalid volume serial for {root_path}")
+
+            serial_bytes = serial_int.to_bytes(4, byteorder="little", signed=False)
+            hwid = hashlib.sha256(serial_bytes).digest()
+            _HWID_CACHE[normalized_drive] = hwid
+            return hwid
+        except (OSError, ValueError) as e:
             raise RuntimeError(f"Failed to get hardware ID for {drive_path} on Windows: {e}")
 
     elif system == "Linux":
@@ -373,6 +404,8 @@ def create_or_load_key(drive_name: str, path: str, uuid: Optional[UUID] = None, 
         return None, None
 
     return random_key, file_uuid
+
+
 
 
 
