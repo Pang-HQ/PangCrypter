@@ -6,40 +6,54 @@ Tests all main functions, GUI components, encryption/decryption, and edge cases.
 
 import sys
 import os
-import tempfile
 import shutil
 import unittest
-from unittest.mock import Mock, patch, MagicMock, mock_open
-from uuid import uuid4, UUID
-import json
+from unittest.mock import Mock, patch
+from uuid import uuid4
 import platform
-import subprocess
+import tempfile
 
-# Add the current directory to Python path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add repository root to Python path for imports
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, repo_root)
 
 # Import PyQt6 components for GUI testing
-from PyQt6.QtWidgets import QApplication, QWidget
-from PyQt6.QtTest import QTest
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QKeyEvent
+from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 # Import application modules
-from main import MainWindow, list_usb_drives, ScreenRecordingChecker
-from main_ui import EditorWidget, EncryptModeDialog, PasswordDialog, USBSelectDialog
-from lib.encrypt import (
-    encrypt_file, decrypt_file, EncryptModeType, derive_key_from_password,
-    _combine_pw_and_key_with_hkdf, SALT_SIZE, KEY_SIZE, NONCE_SIZE, UUID_SIZE
+from pangcrypter.main import MainWindow  # noqa: E402
+from pangcrypter.utils.screen_recording import ScreenRecordingChecker  # noqa: E402
+from pangcrypter.utils.usb import list_usb_drives  # noqa: E402
+from pangcrypter.ui.main_ui import (  # noqa: E402
+    EditorWidget,
+    EncryptModeDialog,
+    PasswordDialog,
+    USBSelectDialog,
 )
-from lib.key import (
-    create_or_load_key, get_file_id, get_drive_hardware_id, 
-    encrypt_random_key_with_hwid, decrypt_random_key_with_hwid,
-    get_key_path, generate_secure_key
+from pangcrypter.core.encrypt import (  # noqa: E402
+    KEY_SIZE,
+    NONCE_SIZE,
+    SALT_SIZE,
+    EncryptModeType,
+    _combine_pw_and_key_with_hkdf,
+    decrypt_file,
+    derive_key_from_password,
+    encrypt_file,
 )
-from preferences import Preferences, PreferencesDialog, PangPreferences
-from messagebox import PangMessageBox
-from styles import DARK_BG, PURPLE, TEXT_COLOR
-import preferences
+from pangcrypter.core.format_config import UUID_SIZE  # noqa: E402
+from pangcrypter.core.key import (  # noqa: E402
+    create_or_load_key,
+    decrypt_random_key,
+    encrypt_random_key,
+    generate_secure_key,
+    get_drive_hardware_id,
+    get_file_id,
+    get_key_path,
+)
+from pangcrypter.ui.messagebox import PangMessageBox  # noqa: E402
+from pangcrypter.utils.preferences import Preferences  # noqa: E402
+import pangcrypter.utils.preferences as preferences  # noqa: E402
+from pangcrypter.utils.mem_guard import MemGuardMode  # noqa: E402
 
 
 class TestEncryptionCore(unittest.TestCase):
@@ -106,12 +120,12 @@ class TestEncryptionCore(unittest.TestCase):
         with open(test_file, "rb") as f:
             data = f.read()
         
-        # Check minimum file size (mode + salt + uuid + nonce + tag + data)
-        min_size = 1 + SALT_SIZE + UUID_SIZE + NONCE_SIZE + 16 + len(self.test_data)
+        # Check minimum file size (settings + salt + uuid + nonce + tag + data)
+        min_size = 16 + SALT_SIZE + 16 + NONCE_SIZE + 16 + len(self.test_data)
         self.assertGreaterEqual(len(data), min_size)
-        
-        # Check mode byte
-        self.assertEqual(data[0], EncryptModeType.MODE_PASSWORD_ONLY.value)
+
+        # Check mode byte in settings
+        self.assertEqual(data[2], EncryptModeType.MODE_PASSWORD_ONLY.value)
         
         # Decrypt
         decrypted = decrypt_file(test_file, password=self.password)
@@ -132,8 +146,8 @@ class TestEncryptionCore(unittest.TestCase):
         with open(test_file, "rb") as f:
             data = f.read()
         
-        # Check mode byte
-        self.assertEqual(data[0], EncryptModeType.MODE_KEY_ONLY.value)
+        # Check mode byte in settings
+        self.assertEqual(data[2], EncryptModeType.MODE_KEY_ONLY.value)
         
         # Decrypt
         decrypted = decrypt_file(test_file, usb_key=self.usb_key)
@@ -154,8 +168,8 @@ class TestEncryptionCore(unittest.TestCase):
         with open(test_file, "rb") as f:
             data = f.read()
         
-        # Check mode byte
-        self.assertEqual(data[0], EncryptModeType.MODE_PASSWORD_PLUS_KEY.value)
+        # Check mode byte in settings
+        self.assertEqual(data[2], EncryptModeType.MODE_PASSWORD_PLUS_KEY.value)
         
         # Decrypt
         decrypted = decrypt_file(test_file, password=self.password, usb_key=self.usb_key)
@@ -170,7 +184,7 @@ class TestEncryptionCore(unittest.TestCase):
             self.test_uuid, password=self.password
         )
         
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             decrypt_file(test_file, password="WrongPassword")
     
     def test_decrypt_wrong_key(self):
@@ -183,7 +197,7 @@ class TestEncryptionCore(unittest.TestCase):
             self.test_uuid, usb_key=self.usb_key
         )
         
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             decrypt_file(test_file, usb_key=wrong_key)
     
     def test_invalid_file_format(self):
@@ -271,17 +285,18 @@ class TestKeyManagement(unittest.TestCase):
         hardware_id = b"test_hardware_id_12345678901234567890"
         
         # Encrypt
-        combined_key = encrypt_random_key_with_hwid(random_key, hardware_id)
+        drive_secret = os.urandom(KEY_SIZE)
+        combined_key = encrypt_random_key(random_key, hardware_id, drive_secret)
         self.assertGreater(len(combined_key), len(random_key))
         
         # Decrypt
-        decrypted_key = decrypt_random_key_with_hwid(combined_key, hardware_id)
+        decrypted_key = decrypt_random_key(combined_key, hardware_id, drive_secret)
         self.assertEqual(decrypted_key, random_key)
         
         # Wrong hardware ID should fail
         wrong_hwid = b"wrong_hardware_id_1234567890123456789"
-        with self.assertRaises(Exception):
-            decrypt_random_key_with_hwid(combined_key, wrong_hwid)
+        with self.assertRaises(ValueError):
+            decrypt_random_key(combined_key, wrong_hwid, drive_secret)
     
     @patch('subprocess.run')
     def test_get_drive_hardware_id_windows(self, mock_run):
@@ -349,9 +364,11 @@ class TestKeyManagement(unittest.TestCase):
         file_id = get_file_id(self.test_file)
         self.assertEqual(file_id, self.test_uuid.hex)
     
-    @patch('lib.key.get_drive_hardware_id')
-    def test_create_or_load_key_create(self, mock_hwid):
+    @patch('pangcrypter.core.key.get_drive_hardware_id')
+    @patch('pangcrypter.core.key._validate_drive_root')
+    def test_create_or_load_key_create(self, mock_validate_root, mock_hwid):
         """Test creating a new key."""
+        mock_validate_root.return_value = self.temp_dir
         mock_hwid.return_value = b"test_hwid" * 4  # 32 bytes
         
         # Create encrypted file first
@@ -370,9 +387,11 @@ class TestKeyManagement(unittest.TestCase):
         key_path = get_key_path(self.temp_dir, self.test_file, self.test_uuid)
         self.assertTrue(os.path.exists(key_path))
     
-    @patch('lib.key.get_drive_hardware_id')
-    def test_create_or_load_key_load(self, mock_hwid):
+    @patch('pangcrypter.core.key.get_drive_hardware_id')
+    @patch('pangcrypter.core.key._validate_drive_root')
+    def test_create_or_load_key_load(self, mock_validate_root, mock_hwid):
         """Test loading an existing key."""
+        mock_validate_root.return_value = self.temp_dir
         mock_hwid.return_value = b"test_hwid" * 4  # 32 bytes
         
         # Create encrypted file first
@@ -400,11 +419,25 @@ class TestKeyManagement(unittest.TestCase):
             self.test_uuid, password="test"
         )
         
-        key, returned_uuid = create_or_load_key(self.temp_dir, self.test_file, create=False)
+        with patch('pangcrypter.core.key._validate_drive_root', return_value=self.temp_dir):
+            key, returned_uuid = create_or_load_key(self.temp_dir, self.test_file, create=False)
         
         # Should return None when key doesn't exist and create=False
         self.assertIsNone(key)
         self.assertIsNone(returned_uuid)
+
+    def test_validate_drive_root_rejects_non_mount_without_override(self):
+        from pangcrypter.core.key import _validate_drive_root
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch('os.path.ismount', return_value=False), patch.dict(os.environ, {}, clear=False):
+                with self.assertRaises(ValueError):
+                    _validate_drive_root(temp_dir)
+
+    def test_validate_drive_root_allows_override(self):
+        from pangcrypter.core.key import _validate_drive_root
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch('os.path.ismount', return_value=False), patch.dict(os.environ, {"PANGCRYPTER_ALLOW_NON_REMOVABLE": "1"}, clear=False):
+                self.assertEqual(_validate_drive_root(temp_dir), os.path.abspath(temp_dir))
 
 
 class TestPreferences(unittest.TestCase):
@@ -431,6 +464,8 @@ class TestPreferences(unittest.TestCase):
         self.assertTrue(prefs.screen_recording_hide_enabled)
         self.assertTrue(prefs.tab_out_hide_enabled)
         self.assertEqual(prefs.tab_setting, "spaces4")
+        self.assertTrue(prefs.session_cache_enabled)
+        self.assertIn(prefs.mem_guard_mode, [m.value for m in MemGuardMode])
     
     def test_preferences_save_load(self):
         """Test saving and loading preferences."""
@@ -471,6 +506,18 @@ class TestPreferences(unittest.TestCase):
         
         # Should have default values
         self.assertEqual(prefs.recording_cooldown, 30)
+
+    def test_preferences_normalize_mem_guard_gating(self):
+        prefs = Preferences(
+            session_cache_enabled=False,
+            mem_guard_mode=MemGuardMode.ULTRA_AGGRESSIVE.value,
+            session_reauth_minutes=99,
+            mem_guard_whitelist=["", 12, "C:/test/app.exe"],
+        )
+        prefs.normalize()
+        self.assertEqual(prefs.mem_guard_mode, MemGuardMode.OFF.value)
+        self.assertEqual(prefs.session_reauth_minutes, 5)
+        self.assertEqual(len(prefs.mem_guard_whitelist), 1)
 
 
 class TestGUIComponents(unittest.TestCase):
@@ -624,7 +671,7 @@ class TestMainApplication(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
     
-    @patch('main.list_usb_drives')
+    @patch('pangcrypter.main.list_usb_drives')
     def test_main_window_creation(self, mock_usb):
         """Test MainWindow creation."""
         mock_usb.return_value = []
@@ -655,17 +702,26 @@ class TestMainApplication(unittest.TestCase):
         window.update_window_title(test_path)
         self.assertEqual(window.windowTitle(), "Editing test - PangCrypter")
     
-    @patch('main.subprocess.check_output')
-    def test_list_usb_drives_windows(self, mock_subprocess):
+    @patch('pangcrypter.utils.usb.subprocess.run')
+    def test_list_usb_drives_windows(self, mock_subprocess_run):
         """Test USB drive listing on Windows."""
         with patch('platform.system', return_value='Windows'):
-            # Mock wmic output
-            mock_subprocess.return_value = b"DeviceID\nF:\nG:\n"
+            mock_result = Mock()
+            mock_result.stdout = "DeviceID\nF:\nG:\n"
+            mock_result.returncode = 0
+            mock_subprocess_run.return_value = mock_result
             
             with patch('os.access', return_value=True):
                 drives = list_usb_drives()
                 self.assertIn("F:\\", drives)
                 self.assertIn("G:\\", drives)
+
+    @patch('pangcrypter.utils.usb.subprocess.run')
+    def test_list_usb_drives_windows_subprocess_failure(self, mock_subprocess_run):
+        with patch('platform.system', return_value='Windows'):
+            mock_subprocess_run.side_effect = OSError("wmic missing")
+            drives = list_usb_drives()
+            self.assertEqual(drives, [])
     
     @patch('os.path.exists')
     @patch('os.listdir')
@@ -704,7 +760,7 @@ class TestMainApplication(unittest.TestCase):
         checker.stop()
         self.assertFalse(checker.running)
     
-    @patch('main.PangMessageBox.warning')
+    @patch('pangcrypter.main.PangMessageBox.warning')
     def test_autosave_without_cached_keys(self, mock_warning):
         """Test autosave behavior without cached keys."""
         window = MainWindow()
@@ -713,7 +769,7 @@ class TestMainApplication(unittest.TestCase):
         window.autosave()
         mock_warning.assert_not_called()
     
-    @patch('main.PangMessageBox.warning')
+    @patch('pangcrypter.main.PangMessageBox.warning')
     def test_autosave_without_saved_file(self, mock_warning):
         """Test autosave behavior without saved file path."""
         window = MainWindow()
@@ -767,7 +823,7 @@ class TestUtilityFunctions(unittest.TestCase):
             
             # Test with directory instead of file
             os.makedirs(os.path.join(temp_dir, "directory.enc"))
-            with self.assertRaises(Exception):
+            with self.assertRaises((IsADirectoryError, PermissionError, OSError, ValueError)):
                 decrypt_file(os.path.join(temp_dir, "directory.enc"))
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
