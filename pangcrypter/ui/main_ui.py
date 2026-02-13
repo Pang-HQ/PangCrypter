@@ -6,7 +6,7 @@ from PyQt6.QtCore import pyqtSignal, Qt
 from ..utils.preferences import PangPreferences
 from ..utils.styles import (
     DARK_BG, DARKER_BG, PURPLE, PURPLE_HOVER, TEXT_COLOR, DISABLED_TEXT_COLOR,
-    BUTTON_TEXT, WARNING_COLOR, EDITOR_FONT_SIZE_PX, EDITOR_FONT_SIZE_PT
+    BUTTON_TEXT, WARNING_COLOR, EDITOR_FONT_SIZE_PT
 )
 
 class EncryptModeDialog(QDialog):
@@ -217,8 +217,14 @@ class EditorWidget(QTextEdit):
 
     def __init__(self):
         super().__init__()
+        self._is_html_mode = False
+        self._global_font_size_pt = float(EDITOR_FONT_SIZE_PT)
         self.setAcceptRichText(False)
         self._tab_setting = PangPreferences.tab_setting
+        base_font = QFont('Segoe UI', int(round(self._global_font_size_pt)))
+        base_font.setPointSizeF(self._global_font_size_pt)
+        self.setFont(base_font)
+        self.document().setDefaultFont(base_font)
         self.setStyleSheet(f"""
             QTextEdit {{
                 background-color: {DARK_BG};
@@ -226,7 +232,6 @@ class EditorWidget(QTextEdit):
                 border: 1px solid {PURPLE};
                 border-radius: 6px;
                 padding: 8px;
-                font-size: {EDITOR_FONT_SIZE_PX}px;
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             }}
             QTextEdit:focus {{
@@ -322,6 +327,10 @@ class EditorWidget(QTextEdit):
 
     def set_tab_setting(self, value):
         self._tab_setting = value
+
+    def set_content_mode(self, is_html_mode: bool):
+        self._is_html_mode = bool(is_html_mode)
+        self.setAcceptRichText(self._is_html_mode)
 
     # Basic key commands handled automatically by QTextEdit:
     # Ctrl+Arrow, Ctrl+Delete, Ctrl+Backspace, Ctrl+Z/Y already supported
@@ -436,6 +445,8 @@ class EditorWidget(QTextEdit):
         cursor.endEditBlock()
     
     def toggle_bold(self):
+        if not self._is_html_mode:
+            return
         cursor = self.textCursor()
         if not cursor.hasSelection():
             # toggle bold at current position, affects next typed char
@@ -451,6 +462,8 @@ class EditorWidget(QTextEdit):
             self.mergeCurrentCharFormat(fmt)
 
     def toggle_italic(self):
+        if not self._is_html_mode:
+            return
         cursor = self.textCursor()
         if not cursor.hasSelection():
             fmt = self.currentCharFormat()
@@ -484,6 +497,14 @@ class EditorWidget(QTextEdit):
         return float(EDITOR_FONT_SIZE_PT)
     
     def change_font_size(self, delta):
+        if not self._is_html_mode:
+            self._global_font_size_pt = max(8.0, min(36.0, self._global_font_size_pt + float(delta)))
+            font = self.font()
+            font.setPointSizeF(self._global_font_size_pt)
+            self.setFont(font)
+            self.document().setDefaultFont(font)
+            return
+
         cursor = self.textCursor()
 
         if not cursor.hasSelection():
@@ -522,6 +543,8 @@ class EditorWidget(QTextEdit):
         cursor.endEditBlock()
 
     def reset_formatting(self):
+        if not self._is_html_mode:
+            return
         cursor = self.textCursor()
         default_fmt = QTextCharFormat()  # no font size override
 

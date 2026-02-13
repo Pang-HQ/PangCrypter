@@ -1,443 +1,524 @@
-"""
-Auto-updater module for PangCrypter.
-Checks for new versions on GitHub and downloads/installs updates.
+"""ZIP updater with checksum + minisign verification.
+
+Security notes:
+- SHA-256 checksums alone are not sufficient for supply-chain trust.
+- PangCrypter requires a pinned minisign public key to verify update payloads.
 """
 
-import os
-import sys
-import json
-import logging
-import requests
-import tempfile
-import subprocess
-import time
-import zipfile
-import shutil
-from typing import Optional, Tuple, Dict, Any
-from packaging import version
+from __future__ import annotations
+
 import hashlib
+import logging
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+from packaging import version
+from ..utils.system_binaries import resolve_trusted_binary
 
 logger = logging.getLogger(__name__)
 
+
 class UpdaterError(Exception):
-    """Custom exception for updater-related errors."""
     pass
 
+
+@dataclass
+class UpdateReport:
+    checksum_verified: bool = False
+    signature_verified: bool = False
+    publisher_verified: bool = False
+    backup_dir: Optional[str] = None
+
+
 class AutoUpdater:
-    """Handles automatic updates for PangCrypter."""
+    """Handles automatic ZIP updates for PangCrypter."""
 
     GITHUB_API_URL = "https://api.github.com/repos/Pang-HQ/PangCrypter/releases/latest"
-    GITHUB_REPO_URL = "https://github.com/Pang-HQ/PangCrypter"
+    GITHUB_RELEASES_URL = "https://api.github.com/repos/Pang-HQ/PangCrypter/releases"
+    REQUIRE_CHECKSUM = True
+    REQUIRE_MINISIGN = True
+    MINISIGN_BINARY = "minisign"
+    TRUSTED_MINISIGN_PUBKEY = (
+        "RWQf9l4fV9nMChQ9i8mQxYQ3V2wqf+Q9+2Qm0S6k7uG2m8Y9G2s3QpQe "
+        "PangCrypter release key"
+    )
+    BACKUP_DIR_NAME = ".pangcrypter_backups"
 
     def __init__(self):
         self.current_version = self._get_current_version()
-        self.temp_dir = tempfile.gettempdir()
+        self.last_update_report = UpdateReport()
 
-    def _get_current_version(self) -> str:
-        """Get the current application version from version.txt."""
+    def _resolve_minisign_binary(self) -> str:
+        env_path = os.getenv("PANGCRYPTER_MINISIGN_PATH", "").strip()
+        candidates: list[str] = []
+
+        if env_path:
+            candidates.append(env_path)
+
+        if os.name == "nt":
+            candidates.extend([
+                str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "minisign" / "minisign.exe"),
+                str(Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "minisign" / "minisign.exe"),
+            ])
+        else:
+            candidates.extend(["/usr/bin/minisign", "/usr/local/bin/minisign"])
+
         try:
-            # Go up three levels: core/ -> pangcrypter/ -> root/
-            version_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "version.txt")
-            with open(version_file, 'r', encoding='utf-8') as f:
+            return resolve_trusted_binary(self.MINISIGN_BINARY, explicit_candidates=candidates)
+        except RuntimeError as e:
+            raise UpdaterError(
+                "No trusted minisign binary found. Set PANGCRYPTER_MINISIGN_PATH to a trusted absolute path."
+            ) from e
+
+    def _project_root(self) -> Path:
+        return Path(__file__).resolve().parents[2]
+
+    def _load_trusted_minisign_public_key(self) -> str:
+        """Load trusted minisign public key with hardcoded pinning.
+
+        Environment/file override is intentionally opt-in for development only.
+        """
+        if os.getenv("PANGCRYPTER_ALLOW_MINISIGN_PUBKEY_OVERRIDE") == "1":
+            env_key = os.getenv("PANGCRYPTER_MINISIGN_PUBKEY", "").strip()
+            if env_key:
+                return env_key
+
+            pubkey_file = self._project_root() / "minisign.pub"
+            if pubkey_file.exists():
+                return pubkey_file.read_text(encoding="utf-8").strip()
+
+        return self.TRUSTED_MINISIGN_PUBKEY
+
+    def get_last_update_report(self) -> UpdateReport:
+        return self.last_update_report
+
+    # --------------------------
+    # Version
+    # --------------------------
+    def _get_current_version(self) -> str:
+        try:
+            version_file = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "version.txt",
+            )
+            with open(version_file, "r", encoding="utf-8") as f:
                 content = f.read()
-
-            # Parse version from the VSVersionInfo format
-            for line in content.split('\n'):
-                if 'filevers=' in line:
-                    # Extract version tuple like (1, 0, 0, 0)
-                    version_tuple = line.split('filevers=(')[1].split(')')[0]
-                    major, minor, patch, build = map(int, version_tuple.split(', '))
-                    return f"{major}.{minor}.{patch}.{build}"
-
-        except Exception as e:
-            logger.error(f"Failed to read current version: {e}")
+            for line in content.splitlines():
+                if "filevers=" in line:
+                    ver_tuple = line.split("filevers=(")[1].split(")")[0]
+                    parts = [int(x) for x in ver_tuple.split(", ")]
+                    return ".".join(map(str, parts))
+        except (OSError, ValueError, IndexError) as e:
+            logger.warning(f"Could not read version.txt: {e}")
             return "0.0.0.0"
 
-    def check_for_updates(self) -> Tuple[bool, Optional[str], Optional[str]]:
-        """
-        Check for updates on GitHub.
-
-        Returns:
-            Tuple of (update_available, latest_version, download_url)
-        """
+    # --------------------------
+    # Update check
+    # --------------------------
+    def check_for_updates(self) -> Tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str]]:
         try:
-            logger.info("Checking for updates...")
-
-            # Make request to GitHub API
             headers = {
-                'User-Agent': 'PangCrypter-Updater/1.0',
-                'Accept': 'application/vnd.github.v3+json'
+                "User-Agent": "PangCrypter-Updater/ZIP",
+                "Accept": "application/vnd.github.v3+json",
             }
-
-            response = requests.get(self.GITHUB_API_URL, headers=headers, timeout=10)
-
-            if response.status_code == 404:
-                # No releases found, try to get all releases including pre-releases
-                logger.info("No latest release found, checking all releases...")
-                releases_url = self.GITHUB_API_URL.replace('/latest', '')
-                response = requests.get(releases_url, headers=headers, timeout=10)
-                response.raise_for_status()
-
-                releases_data = response.json()
-                if not releases_data:
-                    logger.info("No releases found in repository")
-                    return False, None, None
-
-                # Get the most recent release (first in the list)
-                release_data = releases_data[0]
-            else:
-                response.raise_for_status()
-                release_data = response.json()
-
-            latest_version = release_data.get('tag_name', '').lstrip('v')
-
+            r = requests.get(self.GITHUB_API_URL, headers=headers, timeout=15)
+            r.raise_for_status()
+            release = r.json()
+            latest_version = release.get("tag_name", "").lstrip("v")
             if not latest_version:
-                raise UpdaterError("No version tag found in release")
-
-            logger.info(f"Current version: {self.current_version}, Latest version: {latest_version}")
-
-            # Compare versions
-            try:
-                update_available = version.parse(latest_version) > version.parse(self.current_version)
-            except Exception as e:
-                logger.warning(f"Version comparison failed: {e}")
-                # Fallback to string comparison
-                update_available = latest_version != self.current_version
-
-            # Find the Windows exe asset or ZIP file
-            download_url = None
-            for asset in release_data.get('assets', []):
-                asset_name = asset.get('name', '').lower()
-                # Look for exe files or zip files containing pangcrypter
-                if (asset_name.endswith('.exe') or asset_name.endswith('.zip')) and ('pangcrypter' in asset_name or 'pang' in asset_name):
-                    download_url = asset.get('browser_download_url')
-                    break
-
-            if not download_url:
-                logger.warning("No suitable exe asset found in release")
-                return False, latest_version, None
-
-            return update_available, latest_version, download_url
-
+                raise UpdaterError("No version tag in release.")
+            update_available = version.parse(latest_version) > version.parse(self.current_version)
+            zip_url, zip_name = self._get_zip_asset(release)
+            minisig_url = self._get_minisig_asset(release, zip_name)
+            checksum = self._get_release_checksum(release, zip_name)
+            if self.REQUIRE_CHECKSUM and not checksum:
+                raise UpdaterError("No SHA-256 checksum found in release metadata.")
+            if self.REQUIRE_MINISIGN and not minisig_url:
+                raise UpdaterError("No minisign signature asset found for release ZIP.")
+            return update_available, latest_version, zip_url, checksum, minisig_url
         except requests.RequestException as e:
-            logger.error(f"Network error checking for updates: {e}")
-            raise UpdaterError(f"Failed to check for updates: {e}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON response from GitHub: {e}")
-            raise UpdaterError("Invalid response from update server")
-        except Exception as e:
-            logger.error(f"Unexpected error checking for updates: {e}")
+            raise UpdaterError(f"Network error: {e}")
+        except (ValueError, TypeError, KeyError, UpdaterError) as e:
             raise UpdaterError(f"Update check failed: {e}")
 
-    def download_update(self, download_url: str, progress_callback=None) -> str:
-        """
-        Download the update file.
+    def get_available_versions(self) -> List[str]:
+        releases = self._get_releases()
+        versions = []
+        for release in releases:
+            tag = release.get("tag_name", "").lstrip("v")
+            if tag and self._has_zip_asset(release):
+                versions.append(tag)
+        return versions
 
-        Args:
-            download_url: URL to download the update from
-            progress_callback: Optional callback for download progress
+    def get_zip_url_for_version(self, target_version: str) -> Tuple[str, Optional[str], Optional[str]]:
+        releases = self._get_releases()
+        for release in releases:
+            tag = release.get("tag_name", "").lstrip("v")
+            if tag == target_version:
+                zip_url, zip_name = self._get_zip_asset(release)
+                checksum = self._get_release_checksum(release, zip_name)
+                minisig_url = self._get_minisig_asset(release, zip_name)
+                if self.REQUIRE_CHECKSUM and not checksum:
+                    raise UpdaterError("No SHA-256 checksum found in release metadata.")
+                if self.REQUIRE_MINISIGN and not minisig_url:
+                    raise UpdaterError("No minisign signature asset found for release ZIP.")
+                return zip_url, checksum, minisig_url
+        raise UpdaterError(f"No release found for version {target_version}")
 
-        Returns:
-            Path to the downloaded file
-        """
-        try:
-            logger.info(f"Downloading update from: {download_url}")
+    # --------------------------
+    # Download
+    # --------------------------
+    def _create_session_temp_file(self, temp_root: str, suffix: str) -> str:
+        fd, temp_path = tempfile.mkstemp(prefix="pang_update_", suffix=suffix, dir=temp_root)
+        os.close(fd)
+        return temp_path
 
-            # Create temporary file path
-            temp_filename = f"pangcrypter_update_{int(time.time())}.exe"
-            temp_path = os.path.join(self.temp_dir, temp_filename)
-
-            # Download with progress
-            headers = {'User-Agent': 'PangCrypter-Updater/1.0'}
-            response = requests.get(download_url, headers=headers, stream=True, timeout=30)
-            response.raise_for_status()
-
-            total_size = int(response.headers.get('content-length', 0))
-
-            with open(temp_path, 'wb') as f:
-                downloaded = 0
-                for chunk in response.iter_content(chunk_size=8192):
+    def download_zip(self, url: str, temp_root: str, progress_callback=None) -> str:
+        temp_zip = self._create_session_temp_file(temp_root=temp_root, suffix=".zip")
+        headers = {"User-Agent": "PangCrypter-Updater/ZIP"}
+        with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0))
+            downloaded = 0
+            with open(temp_zip, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
+                        if progress_callback and total > 0:
+                            progress_callback(int(downloaded / total * 100), "Downloading...")
+        return temp_zip
 
-                        if progress_callback and total_size > 0:
-                            progress = int((downloaded / total_size) * 100)
-                            progress_callback(progress)
+    def download_file(self, url: str, suffix: str, temp_root: str) -> str:
+        temp_path = self._create_session_temp_file(temp_root=temp_root, suffix=suffix)
+        headers = {"User-Agent": "PangCrypter-Updater/ZIP"}
+        with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(temp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        return temp_path
 
-            logger.info(f"Update downloaded to: {temp_path}")
-            return temp_path
-
-        except requests.RequestException as e:
-            logger.error(f"Download failed: {e}")
-            raise UpdaterError(f"Failed to download update: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error during download: {e}")
-            raise UpdaterError(f"Download failed: {e}")
-
-    def verify_download(self, file_path: str, expected_size: Optional[int] = None) -> bool:
-        """
-        Verify the downloaded file.
-
-        Args:
-            file_path: Path to the downloaded file
-            expected_size: Expected file size if known
-
-        Returns:
-            True if verification passes
-        """
+    # --------------------------
+    # Verify ZIP
+    # --------------------------
+    def verify_zip(self, zip_path: str) -> bool:
+        if not os.path.exists(zip_path):
+            return False
         try:
-            if not os.path.exists(file_path):
-                return False
-
-            # Check file size if expected size is provided
-            if expected_size:
-                actual_size = os.path.getsize(file_path)
-                if actual_size != expected_size:
-                    logger.warning(f"File size mismatch: expected {expected_size}, got {actual_size}")
-                    return False
-
-            # Check file type based on extension
-            if file_path.lower().endswith('.zip'):
-                # Verify ZIP file integrity
-                try:
-                    with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                        # Test the ZIP file
-                        bad_file = zip_ref.testzip()
-                        if bad_file:
-                            logger.warning(f"ZIP file corrupted, bad file: {bad_file}")
-                            return False
-                        logger.info("ZIP file integrity verified")
-                except zipfile.BadZipFile:
-                    logger.warning("Downloaded file is not a valid ZIP file")
-                    return False
-            elif file_path.lower().endswith('.exe'):
-                # Basic executable check (Windows PE header)
-                with open(file_path, 'rb') as f:
-                    header = f.read(2)
-                    if header != b'MZ':  # Windows executable magic number
-                        logger.warning("Downloaded file is not a valid Windows executable")
-                        return False
-            else:
-                logger.warning(f"Unsupported file type: {file_path}")
-                return False
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Verification failed: {e}")
+            with zipfile.ZipFile(zip_path, "r") as z:
+                bad = z.testzip()
+                return bad is None
+        except zipfile.BadZipFile:
             return False
 
-    def install_update(self, update_file_path: str) -> bool:
-        """
-        Install the update by replacing the current installation.
+    def verify_sha256(self, file_path: str, expected_hash: str) -> bool:
+        if not expected_hash:
+            return False
+        hasher = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest().lower() == expected_hash.lower()
 
-        Args:
-            update_file_path: Path to the update file (EXE or ZIP)
-
-        Returns:
-            True if installation successful
-        """
+    def verify_minisign(self, file_path: str, sig_path: str) -> bool:
         try:
-            # Get current installation directory
-            if getattr(sys, 'frozen', False):
-                # Running as PyInstaller bundle
-                current_dir = os.path.dirname(sys.executable)
-            else:
-                # Running in development
-                current_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            minisign_binary = self._resolve_minisign_binary()
+        except UpdaterError as e:
+            logger.error("%s", e)
+            return False
 
-            logger.info(f"Current installation directory: {current_dir}")
-            logger.info(f"Update file: {update_file_path}")
+        trusted_pubkey = self._load_trusted_minisign_public_key()
+        cmd = [
+            minisign_binary,
+            "-V",
+            "-m",
+            file_path,
+            "-x",
+            sig_path,
+            "-P",
+            trusted_pubkey,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError:
+            logger.error("minisign binary not found on system PATH")
+            return False
+        if result.returncode != 0:
+            logger.error("minisign verification failed: %s", (result.stderr or result.stdout).strip())
+            return False
+        return True
 
-            # Create backup directory
-            backup_dir = os.path.join(current_dir, "backup")
-            try:
-                if os.path.exists(backup_dir):
-                    shutil.rmtree(backup_dir)
-                shutil.copytree(current_dir, backup_dir, ignore=shutil.ignore_patterns("backup"))
-                logger.info(f"Created backup: {backup_dir}")
-            except Exception as e:
-                logger.warning(f"Failed to create backup: {e}")
+    # --------------------------
+    # Install
+    # --------------------------
+    def install_zip_update(self, zip_path: str, temp_root: str) -> bool:
+        if getattr(sys, "frozen", False):
+            install_dir = os.path.dirname(sys.executable)
+        else:
+            install_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
-            # Check if update file is a ZIP
-            if update_file_path.lower().endswith('.zip'):
-                # Extract ZIP file
-                extract_dir = os.path.join(self.temp_dir, f"pangcrypter_extract_{int(time.time())}")
-                os.makedirs(extract_dir, exist_ok=True)
+        extract_root = tempfile.mkdtemp(prefix="pang_extract_", dir=temp_root)
 
-                try:
-                    with zipfile.ZipFile(update_file_path, 'r') as zip_ref:
-                        zip_ref.extractall(extract_dir)
-                    logger.info(f"Extracted ZIP to: {extract_dir}")
+        backup_root = os.path.join(install_dir, self.BACKUP_DIR_NAME)
+        os.makedirs(backup_root, exist_ok=True)
+        backup_dir = os.path.join(backup_root, f"backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+        os.makedirs(backup_dir, exist_ok=True)
 
-                    # Find the PangCrypter directory in the extracted files
-                    pangcrypter_dir = None
-                    for item in os.listdir(extract_dir):
-                        item_path = os.path.join(extract_dir, item)
-                        if os.path.isdir(item_path) and 'pangcrypter' in item.lower():
-                            pangcrypter_dir = item_path
-                            break
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            self._safe_extract(zip_ref, extract_root)
 
-                    if not pangcrypter_dir:
-                        raise UpdaterError("Could not find PangCrypter directory in ZIP file")
+        # Flatten if single root folder
+        payload_root = extract_root
+        root_items = os.listdir(extract_root)
+        if len(root_items) == 1 and os.path.isdir(os.path.join(extract_root, root_items[0])):
+            payload_root = os.path.join(extract_root, root_items[0])
 
-                    logger.info(f"Found PangCrypter directory: {pangcrypter_dir}")
+        copied_files: list[tuple[str, str]] = []
+        try:
+            for root, _, files in os.walk(payload_root):
+                rel_path = os.path.relpath(root, payload_root)
+                dest_dir = os.path.join(install_dir, rel_path)
+                os.makedirs(dest_dir, exist_ok=True)
 
-                    # Copy files from extracted directory to current directory
-                    for item in os.listdir(pangcrypter_dir):
-                        src_path = os.path.join(pangcrypter_dir, item)
-                        dst_path = os.path.join(current_dir, item)
+                for file in files:
+                    src = os.path.join(root, file)
+                    dst = os.path.join(dest_dir, file)
 
-                        if os.path.isdir(src_path):
-                            # Copy directory
-                            if os.path.exists(dst_path):
-                                shutil.rmtree(dst_path)
-                            shutil.copytree(src_path, dst_path)
-                        else:
-                            # Copy file
-                            shutil.copy2(src_path, dst_path)
+                    if os.path.exists(dst):
+                        backup_target = os.path.join(backup_dir, os.path.relpath(dst, install_dir))
+                        os.makedirs(os.path.dirname(backup_target), exist_ok=True)
+                        shutil.copy2(dst, backup_target)
+                        copied_files.append((backup_target, dst))
 
-                    logger.info("Update files copied successfully")
-
-                except Exception as e:
-                    logger.error(f"Failed to extract and copy ZIP contents: {e}")
-                    raise UpdaterError(f"Failed to install update from ZIP: {e}")
-                finally:
-                    # Clean up extraction directory
-                    try:
-                        shutil.rmtree(extract_dir)
-                    except:
-                        pass
-
-            else:
-                # Handle EXE file replacement (legacy support)
-                current_exe = os.path.join(current_dir, "PangCrypter.exe")
-                if not os.path.exists(current_exe):
-                    raise UpdaterError("Current executable not found")
-
-                try:
-                    # Create backup of current exe
-                    backup_exe = current_exe + ".backup"
-                    if os.path.exists(backup_exe):
-                        os.remove(backup_exe)
-                    os.rename(current_exe, backup_exe)
-
-                    # Replace with new exe
-                    os.rename(update_file_path, current_exe)
-                    logger.info("EXE update installed successfully")
-
-                except Exception as e:
-                    # Restore backup if installation failed
-                    try:
-                        if os.path.exists(backup_exe):
-                            os.rename(backup_exe, current_exe)
-                    except:
-                        pass
-                    raise UpdaterError(f"Failed to install EXE update: {e}")
-
-            # Clean up backup after successful update
-            if os.path.exists(backup_dir):
-                try:
-                    shutil.rmtree(backup_dir)
-                except:
-                    pass  # Ignore cleanup errors
-
-            logger.info("Update installed successfully")
+                    temp_dst = f"{dst}.tmp"
+                    shutil.copy2(src, temp_dst)
+                    os.replace(temp_dst, dst)
+            self.last_update_report.backup_dir = backup_dir
             return True
+        except (OSError, shutil.Error) as e:
+            logger.error("Update install failed, attempting rollback: %s", e)
+            for backup_src, dst in copied_files:
+                try:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(backup_src, dst)
+                except (OSError, shutil.Error) as rollback_error:
+                    logger.error("Rollback copy failed for %s: %s", dst, rollback_error)
+            raise UpdaterError(f"Install failed: {e}")
+        finally:
+            try:
+                shutil.rmtree(extract_root)
+            except OSError as cleanup_error:
+                logger.debug("Updater cleanup could not remove extract root %s: %s", extract_root, cleanup_error)
 
-        except Exception as e:
-            logger.error(f"Installation failed: {e}")
-            raise UpdaterError(f"Update installation failed: {e}")
+    def restore_from_backup(self, backup_dir: str) -> bool:
+        if not os.path.isdir(backup_dir):
+            raise UpdaterError(f"Backup directory does not exist: {backup_dir}")
 
-    def restart_application(self) -> None:
-        """Restart the application after update."""
-        try:
-            current_exe = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
+        if getattr(sys, "frozen", False):
+            install_dir = os.path.dirname(sys.executable)
+        else:
+            install_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
-            if not getattr(sys, 'frozen', False):
-                # In development, find the built executable
-                dist_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dist")
-                exe_path = os.path.join(dist_dir, "PangCrypter.exe")
-                if os.path.exists(exe_path):
-                    current_exe = exe_path
+        for root, _, files in os.walk(backup_dir):
+            rel_path = os.path.relpath(root, backup_dir)
+            dest_dir = os.path.join(install_dir, rel_path)
+            os.makedirs(dest_dir, exist_ok=True)
+            for file in files:
+                src = os.path.join(root, file)
+                dst = os.path.join(dest_dir, file)
+                tmp_dst = f"{dst}.tmp"
+                shutil.copy2(src, tmp_dst)
+                os.replace(tmp_dst, dst)
+        return True
 
-            logger.info(f"Restarting application: {current_exe}")
-
-            # Start new instance
-            subprocess.Popen([current_exe])
-
-            # Exit current instance
-            sys.exit(0)
-
-        except Exception as e:
-            logger.error(f"Failed to restart application: {e}")
-            raise UpdaterError(f"Failed to restart: {e}")
-
+    # --------------------------
+    # Full update
+    # --------------------------
     def perform_update(self, progress_callback=None) -> bool:
-        """
-        Perform a complete update check, download, and installation.
-
-        Args:
-            progress_callback: Optional callback for progress updates
-
-        Returns:
-            True if update was successful
-        """
+        self.last_update_report = UpdateReport()
+        if progress_callback:
+            progress_callback(10, "Checking for updates...")
+        update_available, latest_version, zip_url, checksum, minisig_url = self.check_for_updates()
+        if not update_available:
+            return False
+        if progress_callback:
+            progress_callback(30, f"Downloading {latest_version}...")
+        temp_root = tempfile.mkdtemp(prefix="pang_update_session_")
+        zip_path: Optional[str] = None
+        sig_path: Optional[str] = None
         try:
-            # Check for updates
+            zip_path = self.download_zip(zip_url, temp_root=temp_root, progress_callback=progress_callback)
+            if minisig_url:
+                sig_path = self.download_file(minisig_url, ".minisig", temp_root=temp_root)
             if progress_callback:
-                progress_callback(10, "Checking for updates...")
-
-            update_available, latest_version, download_url = self.check_for_updates()
-
-            if not update_available:
-                logger.info("No update available")
-                return False
-
-            if not download_url:
-                raise UpdaterError("No download URL available for update")
-
-            # Download update
+                progress_callback(60, "Verifying SHA-256 checksum...")
+            if checksum and not self.verify_sha256(zip_path, checksum):
+                raise UpdaterError("SHA-256 checksum verification failed.")
+            self.last_update_report.checksum_verified = bool(checksum)
             if progress_callback:
-                progress_callback(30, f"Downloading version {latest_version}...")
-
-            update_file = self.download_update(download_url, lambda p: progress_callback(30 + int(p * 0.4)))
-
-            # Verify download
+                progress_callback(70, "Verifying minisign signature...")
+            if self.REQUIRE_MINISIGN:
+                if not sig_path:
+                    raise UpdaterError("Missing minisign signature for update package.")
+                if not self.verify_minisign(zip_path, sig_path):
+                    raise UpdaterError("minisign verification failed.")
+                self.last_update_report.signature_verified = True
+                self.last_update_report.publisher_verified = True
             if progress_callback:
-                progress_callback(70, "Verifying download...")
-
-            if not self.verify_download(update_file):
-                os.remove(update_file)
-                raise UpdaterError("Downloaded file verification failed")
-
-            # Install update
+                progress_callback(80, "Verifying ZIP...")
+            if not self.verify_zip(zip_path):
+                raise UpdaterError("ZIP verification failed.")
             if progress_callback:
                 progress_callback(90, "Installing update...")
-
-            success = self.install_update(update_file)
-
-            if success and progress_callback:
-                progress_callback(100, "Update completed successfully!")
-
+            success = self.install_zip_update(zip_path, temp_root=temp_root)
+            if progress_callback:
+                progress_callback(100, "Update complete!")
             return success
-
-        except UpdaterError:
-            raise
-        except Exception as e:
-            logger.error(f"Update failed: {e}")
-            raise UpdaterError(f"Update failed: {e}")
         finally:
-            # Clean up any temporary files
+            if zip_path and os.path.exists(zip_path):
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    logger.warning("Could not remove temporary ZIP file: %s", zip_path)
+            if sig_path and os.path.exists(sig_path):
+                try:
+                    os.remove(sig_path)
+                except OSError:
+                    logger.warning("Could not remove temporary signature file: %s", sig_path)
             try:
-                # Remove any leftover temp files (this is a best-effort cleanup)
-                for filename in os.listdir(self.temp_dir):
-                    if filename.startswith("pangcrypter_update_") and (filename.endswith(".exe") or filename.endswith(".zip")):
-                        filepath = os.path.join(self.temp_dir, filename)
-                        try:
-                            os.remove(filepath)
-                        except:
-                            pass
-            except:
-                pass
+                shutil.rmtree(temp_root)
+            except OSError as cleanup_error:
+                logger.debug("Updater cleanup could not remove session temp root %s: %s", temp_root, cleanup_error)
+
+    # --------------------------
+    # Restart
+    # --------------------------
+    def restart_application(self):
+        exe = sys.executable
+        args = sys.argv[:]
+        subprocess.Popen([exe] + args)
+        sys.exit(0)
+
+    def _get_releases(self) -> List[Dict[str, Any]]:
+        headers = {
+            "User-Agent": "PangCrypter-Updater/ZIP",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        r = requests.get(self.GITHUB_RELEASES_URL, headers=headers, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def _has_zip_asset(self, release: Dict[str, Any]) -> bool:
+        assets = release.get("assets", [])
+        return any(asset["name"].lower().endswith(".zip") for asset in assets)
+
+    def _get_zip_asset(self, release: Dict[str, Any]) -> Tuple[str, str]:
+        for asset in release.get("assets", []):
+            name = asset["name"]
+            if name.lower().endswith(".zip") and "pang" in name.lower():
+                return asset["browser_download_url"], name
+        raise UpdaterError("No ZIP asset found in release.")
+
+    def _get_minisig_asset(self, release: Dict[str, Any], zip_name: str) -> Optional[str]:
+        exact = f"{zip_name}.minisig".lower()
+        for asset in release.get("assets", []):
+            name = asset.get("name", "").lower()
+            if name == exact:
+                return asset["browser_download_url"]
+
+        for asset in release.get("assets", []):
+            name = asset.get("name", "").lower()
+            if name.endswith(".minisig") and zip_name.lower() in name:
+                return asset["browser_download_url"]
+        return None
+
+    def _get_release_checksum(self, release: Dict[str, Any], zip_name: str) -> Optional[str]:
+        checksum = self._find_checksum_in_text(release.get("body", ""), zip_name)
+        if checksum:
+            return checksum
+
+        for asset in release.get("assets", []):
+            asset_name = asset.get("name", "").lower()
+            if asset_name.endswith(".sha256") or asset_name.endswith(".sha256.txt"):
+                checksum_text = self._download_text(asset["browser_download_url"])
+                checksum = self._find_checksum_in_text(checksum_text, zip_name)
+                if checksum:
+                    return checksum
+        return None
+
+    def _download_text(self, url: str) -> str:
+        headers = {"User-Agent": "PangCrypter-Updater/ZIP"}
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        return r.text
+
+    def _find_checksum_in_text(self, text: str, zip_name: str) -> Optional[str]:
+        if not text:
+            return None
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            match = re.search(r"(?i)sha256\s*\([^\)]+\)\s*=\s*([a-f0-9]{64})", line)
+            if match:
+                return match.group(1)
+
+            hash_match = re.search(r"\b[a-f0-9]{64}\b", line, re.I)
+            if hash_match and (zip_name in line or line.lower().startswith("sha256")):
+                return hash_match.group(0)
+
+            if zip_name and zip_name in line:
+                hash_match = re.search(r"\b[a-f0-9]{64}\b", line, re.I)
+                if hash_match:
+                    return hash_match.group(0)
+
+        return None
+
+    def _safe_extract(self, zip_ref: zipfile.ZipFile, extract_dir: str) -> None:
+        base_path = Path(extract_dir).resolve()
+        for member in zip_ref.infolist():
+            normalized_name = member.filename.replace("\\", "/")
+            member_path = Path(normalized_name)
+            first_part = member_path.parts[0] if member_path.parts else ""
+            if (
+                member_path.is_absolute()
+                or normalized_name.startswith("/")
+                or normalized_name.startswith("\\")
+                or normalized_name.startswith("//")
+                or normalized_name.startswith("\\\\")
+                or ".." in member_path.parts
+            ):
+                raise UpdaterError(f"Unsafe ZIP entry detected: {member.filename}")
+            if ":" in first_part or re.match(r"^[A-Za-z]:", first_part):
+                raise UpdaterError(f"Unsafe ZIP entry detected: {member.filename}")
+
+            unix_mode = (member.external_attr >> 16) & 0o170000
+            if unix_mode == stat.S_IFLNK:
+                raise UpdaterError(f"Unsafe ZIP entry detected: {member.filename}")
+
+            resolved_path = (base_path / normalized_name).resolve()
+            if not resolved_path.is_relative_to(base_path):
+                raise UpdaterError(f"Unsafe ZIP entry detected: {member.filename}")
+
+            if member.is_dir():
+                resolved_path.mkdir(parents=True, exist_ok=True)
+                continue
+
+            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            with zip_ref.open(member, "r") as src, open(resolved_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
