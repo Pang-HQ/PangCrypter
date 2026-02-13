@@ -49,10 +49,9 @@ class AutoUpdater:
     REQUIRE_CHECKSUM = True
     REQUIRE_MINISIGN = True
     MINISIGN_BINARY = "minisign"
-    TRUSTED_MINISIGN_PUBKEY = (
-        "RWQf9l4fV9nMChQ9i8mQxYQ3V2wqf+Q9+2Qm0S6k7uG2m8Y9G2s3QpQe "
-        "PangCrypter release key"
-    )
+    # Keep a pinned minisign key in-app (trust anchor).
+    # This must be the raw key value only (no comments).
+    TRUSTED_MINISIGN_PUBKEY = "RWRT41WQfq43N+sP5WjML1rUvI6EePQvMj9IFS7UulgkX85PCcfi5oI0"
     BACKUP_DIR_NAME = ".pangcrypter_backups"
 
     def __init__(self):
@@ -62,6 +61,22 @@ class AutoUpdater:
     def _resolve_minisign_binary(self) -> str:
         env_path = os.getenv("PANGCRYPTER_MINISIGN_PATH", "").strip()
         candidates: list[str] = []
+
+        # 1) Prefer a bundled minisign next to the running app (or cwd for local runs).
+        local_candidates: list[Path] = []
+        if os.name == "nt":
+            local_names = ("minisign.exe",)
+        else:
+            local_names = ("minisign",)
+
+        app_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path.cwd().resolve()
+        for name in local_names:
+            local_candidates.append(app_dir / name)
+            local_candidates.append(Path.cwd().resolve() / name)
+
+        for candidate in local_candidates:
+            if candidate.exists() and candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
 
         if env_path:
             candidates.append(env_path)
@@ -78,7 +93,8 @@ class AutoUpdater:
             return resolve_trusted_binary(self.MINISIGN_BINARY, explicit_candidates=candidates)
         except RuntimeError as e:
             raise UpdaterError(
-                "No trusted minisign binary found. Set PANGCRYPTER_MINISIGN_PATH to a trusted absolute path."
+                "No minisign binary found. Bundle minisign next to PangCrypter.exe, place it in PATH/trusted location, "
+                "or set PANGCRYPTER_MINISIGN_PATH to a valid absolute path."
             ) from e
 
     def _project_root(self) -> Path:
