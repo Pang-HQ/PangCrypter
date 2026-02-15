@@ -42,21 +42,19 @@ class UpdateReport:
 
 
 class AutoUpdater:
-    """Handles automatic ZIP updates for PangCrypter."""
-
     GITHUB_API_URL = "https://api.github.com/repos/Pang-HQ/PangCrypter/releases/latest"
     GITHUB_RELEASES_URL = "https://api.github.com/repos/Pang-HQ/PangCrypter/releases"
     REQUIRE_CHECKSUM = True
     REQUIRE_MINISIGN = True
     MINISIGN_BINARY = "minisign"
     # Keep a pinned minisign key in-app (trust anchor).
-    # This must be the raw key value only (no comments).
     TRUSTED_MINISIGN_PUBKEY = "RWRT41WQfq43N+sP5WjML1rUvI6EePQvMj9IFS7UulgkX85PCcfi5oI0"
     BACKUP_DIR_NAME = ".pangcrypter_backups"
 
     def __init__(self):
         self.current_version = self._get_current_version()
         self.last_update_report = UpdateReport()
+        self._pending_exe_replacement: Optional[tuple[str, str]] = None
 
     def _resolve_minisign_binary(self) -> str:
         env_path = os.getenv("PANGCRYPTER_MINISIGN_PATH", "").strip()
@@ -321,7 +319,17 @@ class AutoUpdater:
 
                     temp_dst = f"{dst}.tmp"
                     shutil.copy2(src, temp_dst)
-                    os.replace(temp_dst, dst)
+                    try:
+                        os.replace(temp_dst, dst)
+                    except PermissionError as replace_error:
+                        running_exe = getattr(sys, "frozen", False) and os.name == "nt" and os.path.normcase(dst) == os.path.normcase(sys.executable)
+                        if running_exe:
+                            pending_path = f"{dst}.new"
+                            os.replace(temp_dst, pending_path)
+                            self._pending_exe_replacement = (pending_path, dst)
+                            logger.info("Deferred replacement of running executable to restart phase: %s", dst)
+                            continue
+                        raise replace_error
             self.last_update_report.backup_dir = backup_dir
             return True
         except (OSError, shutil.Error) as e:
@@ -425,6 +433,21 @@ class AutoUpdater:
     def restart_application(self):
         exe = sys.executable
         args = sys.argv[:]
+
+        pending = self._pending_exe_replacement
+        if pending and os.name == "nt":
+            pending_new, target_exe = pending
+            if os.path.exists(pending_new):
+                quoted_args = " ".join(f'"{arg}"' for arg in args)
+                launch_cmd = f'start "" "{target_exe}" {quoted_args}'.strip()
+                helper_cmd = (
+                    f'timeout /t 1 /nobreak >nul & '
+                    f'move /y "{pending_new}" "{target_exe}" >nul & '
+                    f'{launch_cmd}'
+                )
+                subprocess.Popen(["cmd", "/c", helper_cmd])
+                sys.exit(0)
+
         subprocess.Popen([exe] + args)
         sys.exit(0)
 

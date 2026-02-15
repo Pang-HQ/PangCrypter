@@ -5,6 +5,15 @@ import os
 
 logger = logging.getLogger(__name__)
 
+
+def is_running_as_admin() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
 def run_as_admin():
     if os.name != "nt":
         return False  # Only relevant for Windows

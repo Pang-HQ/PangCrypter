@@ -94,6 +94,19 @@ def prompt_version(current: str) -> str:
             return version
 
 
+def validate_version_or_raise(version: str) -> str:
+    parts = version.split(".")
+    if len(parts) != 4:
+        raise RuntimeError("Version must have 4 dot-separated parts (e.g. 1.0.0.1)")
+    for idx, raw in enumerate(parts, start=1):
+        if not raw.isdigit():
+            raise RuntimeError(f"Version part {idx} must be numeric")
+        value = int(raw)
+        if value < 0 or value > 99:
+            raise RuntimeError(f"Version part {idx} must be between 0 and 99")
+    return ".".join(str(int(p)) for p in parts)
+
+
 def update_version_txt(content: str, version: str) -> str:
     parts = version.split(".")
     version_tuple = ", ".join(parts)
@@ -276,6 +289,7 @@ def ensure_gh_cli(gh_bin: str) -> None:
 def publish_release(
     gh_bin: str,
     version: str,
+    release_name: str,
     zip_path: Path,
     checksum_path: Path,
     minisig_path: Path,
@@ -283,13 +297,12 @@ def publish_release(
     full_publish: bool,
 ) -> None:
     tag = f"v{version}"
-    title = version
     cmd = [
         gh_bin, "release", "create", tag,
         str(zip_path),
         str(checksum_path),
         str(minisig_path),
-        "--title", title,
+        "--title", release_name,
         "--notes-file", str(notes_path),
     ]
     if not full_publish:
@@ -317,7 +330,9 @@ def print_release_summary(gh_bin: str, version: str) -> None:
     subprocess.run(summary_cmd)
 
 
-def confirm_publish() -> bool:
+def confirm_publish(auto_confirm: bool = False) -> bool:
+    if auto_confirm:
+        return True
     confirm = input("\nPublish GitHub release now? [Y/N]: ").strip().lower()
     return confirm == "y"
 
@@ -325,6 +340,14 @@ def confirm_publish() -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="PangCrypter release automation")
     parser.add_argument("--fullpublish", action="store_true", help="Publish immediately (default: draft)")
+    parser.add_argument("--version", help="Release version (format: X.X.X.X). If omitted, prompts interactively.")
+    parser.add_argument("--release-name", help="Release title shown in GitHub (default: version).")
+    parser.add_argument("--yes", action="store_true", help="Auto-confirm publish prompt.")
+    parser.add_argument(
+        "--skip-notes-edit",
+        action="store_true",
+        help="Do not open/wait for release notes editing step.",
+    )
     parser.add_argument(
         "--minisign-key",
         help="Path to minisign secret key. If omitted, uses PANGCRYPTER_MINISIGN_SECRET_KEY env var.",
@@ -342,7 +365,8 @@ def main() -> int:
     backup = backup_version_files()
     try:
         current_version = parse_current_version()
-        version = prompt_version(current_version)
+        version = validate_version_or_raise(args.version) if args.version else prompt_version(current_version)
+        release_name = args.release_name or version
 
         print("\n▶ Updating version files...")
         version_txt = update_version_txt(backup.version_text, version)
@@ -388,16 +412,26 @@ def main() -> int:
 
         notes_path = write_release_notes(version, checksum_value)
 
-        open_in_vscode(notes_path)
-        input("\nPress Enter to continue after editing release notes...")
+        if not args.skip_notes_edit:
+            open_in_vscode(notes_path)
+            input("\nPress Enter to continue after editing release notes...")
 
         gh_bin = resolve_binary("gh", env_override_key="PANGCRYPTER_GH_PATH")
         ensure_gh_cli(gh_bin)
 
-        if not confirm_publish():
+        if not confirm_publish(auto_confirm=args.yes):
             raise RuntimeError("Publish cancelled by user.")
 
-        publish_release(gh_bin, version, zip_path, checksum_path, minisig_path, notes_path, args.fullpublish)
+        publish_release(
+            gh_bin,
+            version,
+            release_name,
+            zip_path,
+            checksum_path,
+            minisig_path,
+            notes_path,
+            args.fullpublish,
+        )
         print_release_summary(gh_bin, version)
 
         print("\n✅ Release published successfully.")

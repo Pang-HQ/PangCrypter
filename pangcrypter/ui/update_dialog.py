@@ -14,7 +14,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from ..core.updater import AutoUpdater, UpdaterError
 from ..utils.styles import TEXT_COLOR, DARKER_BG, PURPLE, DARK_BG
 from .messagebox import PangMessageBox
-from ..utils.admin import run_as_admin
+from ..utils.admin import run_as_admin, is_running_as_admin
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +75,6 @@ class UpdateWorker(QThread):
             def cb(p, msg):
                 self.progress_updated.emit(p, msg)
 
-            # --------------------------
-            # Prompt admin if needed
-            # --------------------------
-            install_dir = os.path.dirname(sys.executable)
-            if os.name == "nt" and not os.access(install_dir, os.W_OK):
-                run_as_admin()  # exits current process
-
             # Perform update
             success = self.updater.perform_update(cb)
             if success:
@@ -98,7 +91,7 @@ class UpdateDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Check for Updates")
         self.setModal(True)
-        self.resize(500, 400)
+        self.resize(560, 380)
 
         self.updater = AutoUpdater()
         self.update_worker = None
@@ -210,7 +203,7 @@ class UpdateDialog(QDialog):
 
         # Status indicator section
         status_container = QWidget()
-        status_container.setFixedHeight(60)
+        status_container.setMinimumHeight(84)
         status_container.setStyleSheet(f"""
             QWidget {{
                 background-color: {DARKER_BG};
@@ -219,16 +212,18 @@ class UpdateDialog(QDialog):
         """)
 
         status_layout = QHBoxLayout(status_container)
-        status_layout.setContentsMargins(15, 10, 15, 10)
+        status_layout.setContentsMargins(15, 12, 15, 12)
 
         # Status icon
         self.status_icon = QLabel()
-        self.status_icon.setFixedSize(24, 24)
+        self.status_icon.setFixedSize(28, 28)
+        self.status_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._set_status_icon("ready")
         status_layout.addWidget(self.status_icon)
 
         # Status text
         self.status_title = QLabel("Ready to Check")
+        self.status_title.setWordWrap(False)
         self.status_title.setStyleSheet(f"""
             QLabel {{
                 color: {TEXT_COLOR};
@@ -238,7 +233,7 @@ class UpdateDialog(QDialog):
         """)
 
         self.status_subtitle = QLabel("Click 'Check for Updates' to start")
-        self.status_subtitle.setWordWrap(True)
+        self.status_subtitle.setWordWrap(False)
         self.status_subtitle.setStyleSheet("""
             QLabel {
                 color: #888;
@@ -247,7 +242,7 @@ class UpdateDialog(QDialog):
         """)
 
         status_text_layout = QVBoxLayout()
-        status_text_layout.setSpacing(2)
+        status_text_layout.setSpacing(4)
         status_text_layout.addWidget(self.status_title)
         status_text_layout.addWidget(self.status_subtitle)
 
@@ -380,7 +375,7 @@ class UpdateDialog(QDialog):
         main_layout.addWidget(content_widget)
 
         # Set dialog properties
-        self.setFixedSize(480, 320)
+        self.setFixedSize(560, 380)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
         self.setStyleSheet("""
             QDialog {
@@ -472,6 +467,24 @@ class UpdateDialog(QDialog):
 
     def _perform_update(self):
         """Perform the update process."""
+        if self._requires_admin_elevation():
+            answer = PangMessageBox.question(
+                self,
+                "Administrator Rights Required",
+                (
+                    "Installing updates to Program Files requires administrator permissions.\n\n"
+                    "PangCrypter will request elevation now. Continue?"
+                ),
+            )
+            if answer != PangMessageBox.StandardButton.Yes:
+                self._set_status_icon("ready")
+                self.status_title.setText("Ready to Install")
+                self.status_subtitle.setText("Administrator permission was not granted")
+                return
+
+            run_as_admin()
+            return
+
         # Update UI state
         self._set_status_icon("downloading")
         self.status_title.setText("Installing Update")
@@ -490,6 +503,23 @@ class UpdateDialog(QDialog):
         self.update_worker.progress_updated.connect(self._on_progress_updated)
         self.update_worker.update_completed.connect(self._on_update_completed)
         self.update_worker.start()
+
+    def _requires_admin_elevation(self) -> bool:
+        if os.name != "nt":
+            return False
+
+        install_dir = os.path.dirname(sys.executable)
+        if not install_dir:
+            return False
+
+        in_program_files = install_dir.lower().startswith(
+            os.environ.get("ProgramFiles", r"C:\Program Files").lower()
+        ) or install_dir.lower().startswith(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)").lower()
+        )
+
+        needs_write = not os.access(install_dir, os.W_OK)
+        return in_program_files and needs_write and not is_running_as_admin()
 
     def _on_progress_updated(self, progress: int, message: str):
         """Handle progress updates from the update worker."""
