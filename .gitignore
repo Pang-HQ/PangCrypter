@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+# Dev Scripts
+*.bat
+minisign.exe
+
 # Distribution / packaging
 .Python
 build/
