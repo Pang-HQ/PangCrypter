@@ -2,6 +2,7 @@ import ctypes
 import logging
 import sys
 import os
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -19,14 +20,23 @@ def run_as_admin():
         return False  # Only relevant for Windows
 
     try:
-        # ShellExecuteEx to request elevation
-        params = " ".join([f'"{arg}"' for arg in sys.argv])
+        # For frozen builds, launch the app executable with user args (without argv[0]).
+        # For source runs, launch python.exe with script path + args.
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            args = sys.argv[1:]
+        else:
+            executable = sys.executable
+            args = sys.argv
+
+        params = subprocess.list2cmdline(args)
+        working_dir = os.path.dirname(executable) or None
         ret = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, params, None, 1
+            None, "runas", executable, params, working_dir, 1
         )
         if ret <= 32:
             raise OSError(f"Failed to elevate, error code {ret}")
-        sys.exit(0)  # Relaunched with admin, exit current process
+        return True
     except (OSError, AttributeError) as e:
         logger.error("Failed to run as admin: %s", e)
         return False

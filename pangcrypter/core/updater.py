@@ -434,24 +434,24 @@ class AutoUpdater:
     # --------------------------
     def restart_application(self):
         exe = sys.executable
-        args = sys.argv[:]
+        args = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
 
         pending = self._pending_exe_replacement
         if pending and os.name == "nt":
             pending_new, target_exe = pending
             if os.path.exists(pending_new):
-                quoted_args = " ".join(f'"{arg}"' for arg in args)
+                quoted_args = subprocess.list2cmdline(args) if args else ""
                 launch_cmd = f'start "" "{target_exe}" {quoted_args}'.strip()
                 helper_cmd = (
                     f'timeout /t 1 /nobreak >nul & '
                     f'move /y "{pending_new}" "{target_exe}" >nul & '
                     f'{launch_cmd}'
                 )
-                subprocess.Popen(["cmd", "/c", helper_cmd])
-                sys.exit(0)
+                subprocess.Popen(["cmd", "/c", helper_cmd], close_fds=True)
+                return True
 
-        subprocess.Popen([exe] + args)
-        sys.exit(0)
+        subprocess.Popen([exe] + args, close_fds=True)
+        return True
 
     def _get_releases(self) -> List[Dict[str, Any]]:
         headers = {

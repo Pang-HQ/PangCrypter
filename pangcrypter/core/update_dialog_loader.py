@@ -1,39 +1,31 @@
 from __future__ import annotations
 
-import importlib
-import threading
 from types import ModuleType
 from typing import Optional
 
 
 class UpdateDialogLoader:
     def __init__(self):
-        self._lock = threading.Lock()
         self._module: Optional[ModuleType] = None
-        self._loading = False
 
     def _load(self):
-        with self._lock:
-            if self._module is not None or self._loading:
-                return
-            self._loading = True
-        try:
-            module = importlib.import_module("pangcrypter.ui.update_dialog")
-            with self._lock:
-                self._module = module
-        finally:
-            with self._lock:
-                self._loading = False
+        if self._module is not None:
+            return
+        # Use a normal import statement so freezing tools (PyInstaller) can
+        # statically detect and include this module.
+        from ..ui import update_dialog as module
+
+        self._module = module
 
     def preload_async(self):
-        with self._lock:
-            if self._module is not None or self._loading:
-                return
-        threading.Thread(target=self._load, daemon=True).start()
+        # NOTE:
+        # Importing PyQt modules from a Python background thread can trigger
+        # native Qt instability/crashes in frozen builds. Keep this preload on
+        # the GUI/main thread (the caller already schedules it via QTimer).
+        self._load()
 
     def is_ready(self) -> bool:
-        with self._lock:
-            return self._module is not None
+        return self._module is not None
 
     def create_dialog(self, parent=None):
         if self._module is None:

@@ -7,7 +7,7 @@ import os
 import logging
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QProgressBar, QWidget, QInputDialog
+    QProgressBar, QWidget, QInputDialog, QApplication
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 
@@ -482,7 +482,17 @@ class UpdateDialog(QDialog):
                 self.status_subtitle.setText("Administrator permission was not granted")
                 return
 
-            run_as_admin()
+            elevated = run_as_admin()
+            if elevated:
+                # Elevated instance has been launched; close current one cleanly.
+                self.accept()
+                QApplication.quit()
+            else:
+                self._set_status_icon("error")
+                self.status_title.setText("Elevation Failed")
+                self.status_subtitle.setText("Could not start elevated updater")
+                self.progress_text.setVisible(True)
+                self.progress_text.setText("Please try again or run PangCrypter as administrator.")
             return
 
         # Update UI state
@@ -519,7 +529,12 @@ class UpdateDialog(QDialog):
         )
 
         needs_write = not os.access(install_dir, os.W_OK)
-        return in_program_files and needs_write and not is_running_as_admin()
+        if is_running_as_admin():
+            return False
+
+        # os.access() can be unreliable with UAC/virtualization; require elevation
+        # whenever installed under Program Files OR write access is clearly missing.
+        return in_program_files or needs_write
 
     def _on_progress_updated(self, progress: int, message: str):
         """Handle progress updates from the update worker."""
@@ -576,7 +591,10 @@ class UpdateDialog(QDialog):
     def _restart_application(self):
         """Restart the application after successful update."""
         try:
-            self.updater.restart_application()
+            restarted = self.updater.restart_application()
+            if restarted:
+                self.accept()
+                QApplication.quit()
         except (OSError, RuntimeError) as e:
             logger.error(f"Failed to restart application: {e}")
             PangMessageBox.critical(
@@ -632,8 +650,17 @@ class UpdateDialog(QDialog):
         self.check_button.setEnabled(True)
 
     def _check_admin_and_prompt(self):
-        if os.name != "nt":
+        if os.name != "nt" or is_running_as_admin():
             return
         install_dir = os.path.dirname(sys.executable)
-        if not os.access(install_dir, os.W_OK):
-            run_as_admin()
+        in_program_files = install_dir.lower().startswith(
+            os.environ.get("ProgramFiles", r"C:\Program Files").lower()
+        ) or install_dir.lower().startswith(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)").lower()
+        )
+
+        if in_program_files or not os.access(install_dir, os.W_OK):
+            elevated = run_as_admin()
+            if elevated:
+                self.accept()
+                QApplication.quit()

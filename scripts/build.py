@@ -66,6 +66,7 @@ pyinstaller_args = [
     "--hidden-import", "pangcrypter",
     "--hidden-import", "pangcrypter.core",
     "--hidden-import", "pangcrypter.ui",
+    "--hidden-import", "pangcrypter.ui.update_dialog",
     "--hidden-import", "pangcrypter.utils",
 ]
 

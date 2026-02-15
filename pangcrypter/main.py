@@ -217,7 +217,6 @@ class MainWindow(QMainWindow):
         self.menuBar().setEnabled(False)
         QTimer.singleShot(0, self._after_first_paint_init)
         QTimer.singleShot(50, PangPreferences.preload_async)
-        QTimer.singleShot(150, update_dialog_loader.preload_async)
 
     def _after_first_paint_init(self):
         self._init_timers()
@@ -285,7 +284,7 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage("Preparing updater…", 1500)
             dialog = update_dialog_loader.create_dialog(self)
             dialog.exec()
-        except (OSError, RuntimeError, ValueError) as e:
+        except Exception as e:
             logger.error(f"Failed to open update dialog: {e}")
             PangMessageBox.critical(self, "Update Error", f"Failed to open update dialog:\n{e}")
     
