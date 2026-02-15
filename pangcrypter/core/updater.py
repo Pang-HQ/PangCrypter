@@ -132,10 +132,12 @@ class AutoUpdater:
                 if "filevers=" in line:
                     ver_tuple = line.split("filevers=(")[1].split(")")[0]
                     parts = [int(x) for x in ver_tuple.split(", ")]
+                    if len(parts) >= 3:
+                        return ".".join(map(str, parts[:3]))
                     return ".".join(map(str, parts))
         except (OSError, ValueError, IndexError) as e:
             logger.warning(f"Could not read version.txt: {e}")
-            return "0.0.0.0"
+            return "0.0.0"
 
     # --------------------------
     # Update check
