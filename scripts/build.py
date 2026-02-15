@@ -53,7 +53,7 @@ entry_file = os.path.join(project_root, "run.py")
 pyinstaller_args = [
     entry_file,
     "--name", "PangCrypter",
-    "--onefile",
+    "--onedir",
     "--windowed",
     "--noconfirm",
     "--icon", os.path.join(project_root, "ui", "logo.ico"),
@@ -79,7 +79,7 @@ else:
 # PyInstaller build
 PyInstaller.__main__.run(pyinstaller_args)
 
-# Create ZIP distribution with proper folder structure
+# Create ZIP distribution with proper folder structure (onedir bundle)
 import zipfile
 
 dist_dir = "dist"
@@ -87,39 +87,28 @@ zip_name = "PangCrypter.zip"
 pangcrypter_folder = "PangCrypter"
 
 if os.path.exists(dist_dir):
+    bundle_dir = os.path.join(dist_dir, pangcrypter_folder)
+
+    # Add bundled minisign binary for updater signature verification
+    minisign_src = resolve_minisign_for_bundle()
+    if minisign_src and os.path.isdir(bundle_dir):
+        minisign_name = "minisign.exe" if os.name == "nt" else "minisign"
+        shutil.copy2(minisign_src, os.path.join(bundle_dir, minisign_name))
+    elif not minisign_src:
+        print("⚠️ minisign binary not found; PangCrypter.zip will not include minisign.")
+
     with zipfile.ZipFile(os.path.join(dist_dir, zip_name), 'w', zipfile.ZIP_DEFLATED) as zipf:
-        # Add the executable
-        exe_path = os.path.join(dist_dir, "PangCrypter.exe")
-        if os.path.exists(exe_path):
-            zipf.write(exe_path, os.path.join(pangcrypter_folder, "PangCrypter.exe"))
+        if not os.path.isdir(bundle_dir):
+            raise FileNotFoundError(f"Expected onedir output not found: {bundle_dir}")
 
-        # Add the ui folder contents
-        ui_src = os.path.join(project_root, "ui")
-        if os.path.exists(ui_src):
-            for root, dirs, files in os.walk(ui_src):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    # Add to ui/ subfolder in ZIP
-                    arcname = os.path.join(pangcrypter_folder, "ui", os.path.relpath(file_path, ui_src))
-                    zipf.write(file_path, arcname)
-
-        # Add version.txt
-        version_src = os.path.join(project_root, "version.txt")
-        if os.path.exists(version_src):
-            zipf.write(version_src, os.path.join(pangcrypter_folder, "version.txt"))
-
-        # Add bundled minisign binary for updater signature verification
-        minisign_src = resolve_minisign_for_bundle()
-        if minisign_src:
-            minisign_name = "minisign.exe" if os.name == "nt" else "minisign"
-            zipf.write(minisign_src, os.path.join(pangcrypter_folder, minisign_name))
-        else:
-            print("⚠️ minisign binary not found; PangCrypter.zip will not include minisign.")
+        for root, _dirs, files in os.walk(bundle_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                rel_path = os.path.relpath(file_path, bundle_dir)
+                arcname = os.path.join(pangcrypter_folder, rel_path)
+                zipf.write(file_path, arcname)
 
     print(f"\n✅ ZIP distribution created: {os.path.join(dist_dir, zip_name)}")
-    print(
-        f"   Contents: {pangcrypter_folder}/PangCrypter.exe, {pangcrypter_folder}/ui/, "
-        f"{pangcrypter_folder}/version.txt, {pangcrypter_folder}/minisign(.exe)"
-    )
+    print(f"   Contents: full onedir bundle in {pangcrypter_folder}/")
 
-print("\n✅ Build complete! Check the 'dist' folder for PangCrypter.exe and PangCrypter.zip")
+print("\n✅ Build complete! Check the 'dist' folder for PangCrypter/ and PangCrypter.zip")
