@@ -167,9 +167,20 @@ class MainWindow(QMainWindow):
         self.hidden_label = QLabel("", self)
         self.hidden_label.setObjectName("HiddenNoticeLabel")
         self.hidden_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hidden_label.setWordWrap(True)
         self.hidden_label.hide()
-        self.hidden_label.setGeometry(50, 50, 700, 100)
+        self._layout_hidden_label()
         self.hidden_label.mousePressEvent = self.privacy_guard.on_hidden_label_clicked
+
+    def _layout_hidden_label(self):
+        rect = self.contentsRect()
+        margin_x = 40
+        margin_y = 40
+        width = max(280, rect.width() - (margin_x * 2))
+        height = max(96, min(180, rect.height() // 3))
+        x = rect.x() + (rect.width() - width) // 2
+        y = rect.y() + (rect.height() - height) // 2
+        self.hidden_label.setGeometry(x, y, width, height)
 
     def _init_timer_placeholders(self):
         self._menus_built = False
@@ -1066,6 +1077,10 @@ class MainWindow(QMainWindow):
             self.screen_recorder_thread.quit()
             self.screen_recorder_thread.wait(1500)
         super().closeEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_hidden_label()
 
     def show_content_mode_menu(self, pos):
         menu = QMenu(self)
