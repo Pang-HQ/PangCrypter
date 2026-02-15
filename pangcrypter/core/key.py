@@ -9,6 +9,7 @@ import subprocess
 import ctypes
 from ctypes import wintypes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 
 from .encrypt import EncryptModeType
 from .format_config import (
@@ -243,7 +244,90 @@ def decrypt_random_key(combined_key: bytes, hardware_id: bytes, drive_secret: by
     aes_key = hashlib.sha256(hardware_id + drive_secret).digest()
     aesgcm = AESGCM(aes_key)
 
-    return aesgcm.decrypt(nonce, ciphertext, None)
+    try:
+        return aesgcm.decrypt(nonce, ciphertext, None)
+    except InvalidTag as e:
+        raise ValueError(
+            "USB key decryption failed (auth tag mismatch). This usually means wrong USB drive, "
+            "changed drive identity/secret, or corrupted key file."
+        ) from e
+
+
+def _get_windows_volume_serial_number(drive_path: str) -> int:
+    drive_letter = drive_path.rstrip("\\/")[:2]  # e.g. "F:"
+    if len(drive_letter) != 2 or drive_letter[1] != ":":
+        raise ValueError(f"Invalid Windows drive path: {drive_path}")
+    root_path = f"{drive_letter}\\"
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_volume_information = kernel32.GetVolumeInformationW
+    get_volume_information.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    get_volume_information.restype = wintypes.BOOL
+
+    serial_number = wintypes.DWORD(0)
+    max_component_len = wintypes.DWORD(0)
+    file_system_flags = wintypes.DWORD(0)
+    ok = bool(
+        get_volume_information(
+            root_path,
+            None,
+            0,
+            ctypes.byref(serial_number),
+            ctypes.byref(max_component_len),
+            ctypes.byref(file_system_flags),
+            None,
+            0,
+        )
+    )
+    if not ok:
+        err = ctypes.get_last_error()
+        raise OSError(err, f"GetVolumeInformationW failed for {root_path}")
+
+    serial_int = int(serial_number.value)
+    if serial_int == 0:
+        raise ValueError(f"Invalid volume serial for {root_path}")
+    return serial_int
+
+
+def _legacy_windows_hardware_id(drive_path: str) -> bytes:
+    """Compatibility with <=1.0.2.1 HWID derivation (wmic serial hex bytes)."""
+    serial_int = _get_windows_volume_serial_number(drive_path)
+    serial_hex = f"{serial_int:08X}"
+    try:
+        serial_bytes = bytes.fromhex(serial_hex)
+    except ValueError:
+        serial_bytes = serial_hex.encode("utf-8")
+    return hashlib.sha256(serial_bytes).digest()
+
+
+def _rewrite_key_with_current_hwid(
+    *,
+    key_path: str,
+    random_key: bytes,
+    hardware_id: bytes,
+    drive_secret: bytes,
+) -> None:
+    """Rewrite existing key blob using current HWID derivation.
+
+    Best-effort migration step for backward compatibility.
+    """
+    combined_key = encrypt_random_key(random_key, hardware_id, drive_secret)
+    tmp_path = f"{key_path}.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(combined_key)
+    _set_posix_permissions(tmp_path, is_dir=False)
+    os.replace(tmp_path, key_path)
+    _set_posix_permissions(key_path, is_dir=False)
+    _set_windows_restrictive_acl(key_path, is_dir=False)
 
 
 def get_drive_hardware_id(drive_path: str) -> bytes:
@@ -265,49 +349,7 @@ def get_drive_hardware_id(drive_path: str) -> bytes:
     if system == "Windows":
         # Prefer WinAPI volume serial query to avoid spawning console subprocesses
         try:
-            drive_letter = drive_path.rstrip("\\/")[:2]  # e.g. "F:"
-            if len(drive_letter) != 2 or drive_letter[1] != ":":
-                raise ValueError(f"Invalid Windows drive path: {drive_path}")
-            root_path = f"{drive_letter}\\"
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            get_volume_information = kernel32.GetVolumeInformationW
-            get_volume_information.argtypes = [
-                wintypes.LPCWSTR,
-                wintypes.LPWSTR,
-                wintypes.DWORD,
-                ctypes.POINTER(wintypes.DWORD),
-                ctypes.POINTER(wintypes.DWORD),
-                ctypes.POINTER(wintypes.DWORD),
-                wintypes.LPWSTR,
-                wintypes.DWORD,
-            ]
-            get_volume_information.restype = wintypes.BOOL
-
-            serial_number = wintypes.DWORD(0)
-            max_component_len = wintypes.DWORD(0)
-            file_system_flags = wintypes.DWORD(0)
-            # We only need serial_number, so keep volume/fs-name buffers null.
-            ok = bool(
-                get_volume_information(
-                    root_path,
-                    None,
-                    0,
-                    ctypes.byref(serial_number),
-                    ctypes.byref(max_component_len),
-                    ctypes.byref(file_system_flags),
-                    None,
-                    0,
-                )
-            )
-            if not ok:
-                err = ctypes.get_last_error()
-                raise OSError(err, f"GetVolumeInformationW failed for {root_path}")
-
-            serial_int = int(serial_number.value)
-            if serial_int == 0:
-                raise ValueError(f"Invalid volume serial for {root_path}")
-
+            serial_int = _get_windows_volume_serial_number(drive_path)
             serial_bytes = serial_int.to_bytes(4, byteorder="little", signed=False)
             hwid = hashlib.sha256(serial_bytes).digest()
             _HWID_CACHE[normalized_drive] = hwid
@@ -392,7 +434,29 @@ def create_or_load_key(drive_name: str, path: str, uuid: Optional[UUID] = None, 
     if os.path.exists(key_path):
         with open(key_path, "rb") as f:
             combined_key = f.read()
-        random_key = decrypt_random_key(combined_key, hardware_id, drive_secret)
+        try:
+            random_key = decrypt_random_key(combined_key, hardware_id, drive_secret)
+        except ValueError as e:
+            # Backward compatibility: <=1.0.2.1 used a different Windows HWID derivation.
+            if platform.system() == "Windows" and "auth tag mismatch" in str(e).lower():
+                legacy_hwid = _legacy_windows_hardware_id(drive_root)
+                random_key = decrypt_random_key(combined_key, legacy_hwid, drive_secret)
+                try:
+                    _rewrite_key_with_current_hwid(
+                        key_path=key_path,
+                        random_key=random_key,
+                        hardware_id=hardware_id,
+                        drive_secret=drive_secret,
+                    )
+                    logger.info("Migrated legacy USB key blob to current HWID derivation: %s", key_path)
+                except (OSError, ValueError) as migrate_error:
+                    logger.warning(
+                        "Loaded legacy USB key but failed to migrate key blob at %s: %s",
+                        key_path,
+                        migrate_error,
+                    )
+            else:
+                raise
     elif create:
         random_key = generate_secure_key()
         combined_key = encrypt_random_key(random_key, hardware_id, drive_secret)
@@ -404,6 +468,9 @@ def create_or_load_key(drive_name: str, path: str, uuid: Optional[UUID] = None, 
         return None, None
 
     return random_key, file_uuid
+
+
+
 
 
 
