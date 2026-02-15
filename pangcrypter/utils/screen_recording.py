@@ -1,5 +1,6 @@
 import logging
 from time import sleep
+from threading import Event
 
 import psutil
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -28,11 +29,13 @@ class ScreenRecordingChecker(QObject):
         super().__init__()
         self.check_interval = check_interval
         self.running = True
+        self._stop_event = Event()
         self._last_status = False
         self.cached_procs = set()
 
     def stop(self):
         self.running = False
+        self._stop_event.set()
 
     def run(self):
         while self.running:
@@ -60,4 +63,5 @@ class ScreenRecordingChecker(QObject):
             except (psutil.Error, OSError, RuntimeError) as e:
                 logger.debug("Screen recorder process scan failed: %s", e)
 
-            sleep(self.check_interval)
+            if self._stop_event.wait(self.check_interval):
+                break

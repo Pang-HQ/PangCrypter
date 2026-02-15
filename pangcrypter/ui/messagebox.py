@@ -1,38 +1,9 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QLabel, QMessageBox
-from ..utils.styles import BUTTON_TEXT, DARKER_BG, PURPLE, PURPLE_HOVER, TEXT_COLOR
 
 class PangMessageBox(QMessageBox):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-        self.setStyleSheet(f"""
-            QMessageBox {{
-                background-color: {DARKER_BG};
-                color: {TEXT_COLOR};
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                font-size: 13px;
-            }}
-            QLabel {{
-                color: {TEXT_COLOR};
-                min-width: 420px;
-            }}
-            QPushButton {{
-                background-color: {PURPLE};
-                color: {TEXT_COLOR};
-                border-radius: 5px;
-                padding: 8px 14px;
-                font-weight: 600;
-                min-width: 140px;
-            }}
-            QPushButton:hover {{
-                background-color: {PURPLE_HOVER};
-            }}
-            QPushButton:pressed {{
-                background-color: {PURPLE};
-                color: {BUTTON_TEXT};
-            }}
-        """)
         self.setTextFormat(Qt.TextFormat.PlainText)
 
     def _prepare_layout(self):

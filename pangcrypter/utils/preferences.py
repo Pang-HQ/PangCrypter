@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import platform
+import hashlib
+import sys
 
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -13,6 +15,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QListView,
     QPushButton,
     QSpinBox,
@@ -21,16 +24,39 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from PyQt6.QtGui import QGuiApplication
-
-from .mem_guard import (
-    MemGuardMode,
-    default_mem_guard_mode,
-    estimate_scan_time_ms,
-    file_sha256,
-    is_mem_guard_supported,
-)
+from PyQt6.QtCore import Qt, QSize
 
 logger = logging.getLogger(__name__)
+
+MEM_GUARD_MODE_OFF = "off"
+MEM_GUARD_MODE_NORMAL = "normal"
+MEM_GUARD_MODE_ULTRA = "ultra_aggressive"
+
+
+def default_mem_guard_mode() -> str:
+    return MEM_GUARD_MODE_NORMAL if _is_mem_guard_supported() else MEM_GUARD_MODE_OFF
+
+
+def _is_mem_guard_supported() -> bool:
+    return os.name == "nt" and platform.system() == "Windows"
+
+
+def _estimate_scan_time_ms(**kwargs):
+    try:
+        from .mem_guard import estimate_scan_time_ms
+        return estimate_scan_time_ms(**kwargs)
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return None
+
+
+def _file_sha256(path: str) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _CHEVRON_DOWN = os.path.join(_PROJECT_ROOT, "ui", "chevron-down.svg").replace("\\", "/")
@@ -83,6 +109,11 @@ def _preferences_stylesheet() -> str:
         QListWidget::item:selected {{
             background-color: #333;
             color: #eee;
+        }}
+        QListWidget#MemGuardWhitelistList::item {{
+            padding: 4px 8px;
+            margin: 0;
+            border-radius: 4px;
         }}
         QCheckBox {{
             color: #ccc;
@@ -259,13 +290,13 @@ class Preferences:
             min(120, max(5, int(self.session_infocus_inactivity_minutes))),
         )
 
-        if not self.session_cache_enabled or not is_mem_guard_supported():
-            self.mem_guard_mode = MemGuardMode.OFF.value
+        if not self.session_cache_enabled or not _is_mem_guard_supported():
+            self.mem_guard_mode = MEM_GUARD_MODE_OFF
 
         self.mem_guard_scan_interval_ms = max(20, min(200, int(self.mem_guard_scan_interval_ms)))
         self.mem_guard_pid_cache_cap = max(32, min(512, int(self.mem_guard_pid_cache_cap)))
 
-        valid_modes = {m.value for m in MemGuardMode}
+        valid_modes = {MEM_GUARD_MODE_OFF, MEM_GUARD_MODE_NORMAL, MEM_GUARD_MODE_ULTRA}
         if self.mem_guard_mode not in valid_modes:
             self.mem_guard_mode = default_mem_guard_mode()
 
@@ -367,6 +398,8 @@ class PreferencesDialog(QDialog):
         self.setWindowTitle("Preferences")
         self.resize(780, 560)
         self.setStyleSheet(_preferences_stylesheet())
+        self._hidden_self_whitelist_entries: list[dict] = []
+        self._self_exe_path, self._self_exe_sha = self._current_executable_identity()
 
         root = QVBoxLayout(self)
         body = QHBoxLayout()
@@ -374,6 +407,7 @@ class PreferencesDialog(QDialog):
 
         self.sidebar = QListWidget()
         self.sidebar.setFixedWidth(170)
+        self.sidebar.setSpacing(8)
         self.sidebar.addItems(["General", "Session", "Memory Guard", "Editor"])
         body.addWidget(self.sidebar)
 
@@ -459,9 +493,9 @@ class PreferencesDialog(QDialog):
 
         layout.addWidget(QLabel("Memory guard mode:"))
         self.mem_guard_combo = StableComboBox()
-        self.mem_guard_combo.addItem("Off", MemGuardMode.OFF.value)
-        self.mem_guard_combo.addItem("Normal (recommended)", MemGuardMode.NORMAL.value)
-        self.mem_guard_combo.addItem("Ultra aggressive (not recommended)", MemGuardMode.ULTRA_AGGRESSIVE.value)
+        self.mem_guard_combo.addItem("Off", MEM_GUARD_MODE_OFF)
+        self.mem_guard_combo.addItem("Normal (recommended)", MEM_GUARD_MODE_NORMAL)
+        self.mem_guard_combo.addItem("Ultra aggressive (not recommended)", MEM_GUARD_MODE_ULTRA)
         self.mem_guard_combo.setCurrentIndex(max(0, self.mem_guard_combo.findData(PangPreferences.mem_guard_mode)))
         layout.addWidget(self.mem_guard_combo)
 
@@ -491,11 +525,19 @@ class PreferencesDialog(QDialog):
 
         layout.addWidget(QLabel("Memory guard whitelist (executable paths):"))
         self.whitelist_list = QListWidget()
+        self.whitelist_list.setObjectName("MemGuardWhitelistList")
+        self.whitelist_list.setSpacing(2)
+        self.whitelist_list.itemDoubleClicked.connect(self._toggle_whitelist_item_details)
         for item in PangPreferences.mem_guard_whitelist:
             if isinstance(item, dict):
                 p = item.get("path", "")
                 s = item.get("sha256", "")
-                self.whitelist_list.addItem(f"{p} | {s}" if s else p)
+                if self._should_hide_self_whitelist_entry(p, s):
+                    self._hidden_self_whitelist_entries.append(
+                        {"path": os.path.abspath(str(p).strip()), "sha256": str(s or "").strip().lower()}
+                    )
+                    continue
+                self._add_whitelist_list_item(p, s)
         layout.addWidget(self.whitelist_list)
 
         wl_row = QHBoxLayout()
@@ -544,12 +586,12 @@ class PreferencesDialog(QDialog):
         self.spaces_spin.setVisible(is_spaces)
 
     def _estimate_scan_time(self):
-        if not is_mem_guard_supported() or not self.enable_session_cache.isChecked():
+        if not _is_mem_guard_supported() or not self.enable_session_cache.isChecked():
             self.scan_estimate_label.setText("Expected scan time: unavailable")
             return
         self.scan_estimate_label.setText("Expected scan time: sampling...")
         self.repaint()
-        avg = estimate_scan_time_ms(
+        avg = _estimate_scan_time_ms(
             samples=25,
             max_entries=0,
             cache_cap=self.cache_cap_spin.value(),
@@ -563,7 +605,7 @@ class PreferencesDialog(QDialog):
             )
 
     def _update_mem_guard_controls(self):
-        supported = is_mem_guard_supported()
+        supported = _is_mem_guard_supported()
         session_ok = self.enable_session_cache.isChecked()
         enabled = supported and session_ok
 
@@ -582,7 +624,7 @@ class PreferencesDialog(QDialog):
             self.mem_guard_info.setText("Memory guard is available on Windows only.")
         elif not session_ok:
             self.mem_guard_info.setText("Enable session caching to use memory guard.")
-            self.mem_guard_combo.setCurrentIndex(self.mem_guard_combo.findData(MemGuardMode.OFF.value))
+            self.mem_guard_combo.setCurrentIndex(self.mem_guard_combo.findData(MEM_GUARD_MODE_OFF))
         else:
             self.mem_guard_info.setText("Memory guard will monitor suspicious process memory access.")
 
@@ -591,16 +633,87 @@ class PreferencesDialog(QDialog):
         if not path:
             return
         path = os.path.abspath(path)
-        digest = file_sha256(path)
-        display = f"{path} | {digest}" if digest else path
-        existing = {self.whitelist_list.item(i).text() for i in range(self.whitelist_list.count())}
-        if display not in existing:
-            self.whitelist_list.addItem(display)
+        digest = _file_sha256(path)
+        if self._should_hide_self_whitelist_entry(path, digest):
+            return
+        canonical = os.path.normcase(path)
+        for i in range(self.whitelist_list.count()):
+            existing_item = self.whitelist_list.item(i)
+            payload = existing_item.data(Qt.ItemDataRole.UserRole) or {}
+            existing_path = os.path.normcase(str(payload.get("path", "")))
+            if existing_path == canonical:
+                return
+        self._add_whitelist_list_item(path, digest)
 
     def _remove_whitelist_entry(self):
         row = self.whitelist_list.currentRow()
         if row >= 0:
             self.whitelist_list.takeItem(row)
+
+    def _compact_whitelist_text(self, path: str) -> str:
+        prog_name = os.path.basename(path) or path
+        return f"▸ {prog_name}"
+
+    def _expanded_whitelist_text(self, path: str, sha256: str) -> str:
+        prog_name = os.path.basename(path) or path
+        sig = sha256 or "(not recorded)"
+        return f"▾ {prog_name}\n - Path: {path}\n - SHA256: {sig}"
+
+    def _set_whitelist_item_size(self, item: QListWidgetItem, expanded: bool) -> None:
+        fm = self.whitelist_list.fontMetrics()
+        # Keep compact rows tight and force shrink-back after collapse.
+        lines = 3 if expanded else 1
+        height = (fm.lineSpacing() * lines) + (8 if expanded else 6)
+        item.setSizeHint(QSize(0, height))
+
+    def _current_executable_identity(self) -> tuple[str, str]:
+        exe_path = os.path.abspath(sys.executable or "")
+        if not exe_path or not os.path.exists(exe_path):
+            return "", ""
+        return exe_path, _file_sha256(exe_path).lower()
+
+    def _should_hide_self_whitelist_entry(self, path: str, sha256: str) -> bool:
+        if not self._self_exe_path or not self._self_exe_sha:
+            return False
+        candidate_path = os.path.abspath(str(path or "").strip())
+        candidate_sha = str(sha256 or "").strip().lower()
+        if not candidate_path or not candidate_sha:
+            return False
+        return (
+            os.path.normcase(candidate_path) == os.path.normcase(self._self_exe_path)
+            and candidate_sha == self._self_exe_sha
+        )
+
+    def _add_whitelist_list_item(self, path: str, sha256: str):
+        item = QListWidgetItem(self._compact_whitelist_text(path))
+        item.setData(
+            Qt.ItemDataRole.UserRole,
+            {
+                "path": path,
+                "sha256": str(sha256 or "").strip().lower(),
+                "expanded": False,
+            },
+        )
+        self._set_whitelist_item_size(item, expanded=False)
+        self.whitelist_list.addItem(item)
+
+    def _toggle_whitelist_item_details(self, item: QListWidgetItem):
+        payload = item.data(Qt.ItemDataRole.UserRole) or {}
+        path = str(payload.get("path", "")).strip()
+        sha = str(payload.get("sha256", "")).strip().lower()
+        expanded = bool(payload.get("expanded", False))
+        if not path:
+            return
+
+        next_expanded = not expanded
+        payload["expanded"] = next_expanded
+        item.setData(Qt.ItemDataRole.UserRole, payload)
+        if next_expanded:
+            item.setText(self._expanded_whitelist_text(path, sha))
+            self._set_whitelist_item_size(item, expanded=True)
+        else:
+            item.setText(self._compact_whitelist_text(path))
+            self._set_whitelist_item_size(item, expanded=False)
 
     def accept(self):
         PangPreferences.recording_cooldown = self.cooldown_spin.value()
@@ -616,19 +729,40 @@ class PreferencesDialog(QDialog):
         PangPreferences.mem_guard_scan_interval_ms = self.scan_interval_spin.value()
         PangPreferences.mem_guard_pid_cache_cap = self.cache_cap_spin.value()
         requested_mode = self.mem_guard_combo.currentData()
-        if not PangPreferences.session_cache_enabled or not is_mem_guard_supported():
-            PangPreferences.mem_guard_mode = MemGuardMode.OFF.value
+        if not PangPreferences.session_cache_enabled or not _is_mem_guard_supported():
+            PangPreferences.mem_guard_mode = MEM_GUARD_MODE_OFF
         else:
             PangPreferences.mem_guard_mode = requested_mode
 
         whitelist_items: list[dict] = []
         for i in range(self.whitelist_list.count()):
-            raw = self.whitelist_list.item(i).text()
-            if " | " in raw:
-                path, sha = raw.split(" | ", 1)
-            else:
-                path, sha = raw, ""
-            whitelist_items.append({"path": path.strip(), "sha256": sha.strip().lower()})
+            item = self.whitelist_list.item(i)
+            payload = item.data(Qt.ItemDataRole.UserRole) or {}
+            path = str(payload.get("path", "")).strip()
+            sha = str(payload.get("sha256", "")).strip().lower()
+            if not path:
+                raw = item.text()
+                if " | " in raw:
+                    _, maybe_path = raw.split(" | ", 1)
+                    path = maybe_path.strip()
+            if path:
+                whitelist_items.append({"path": path, "sha256": sha})
+
+        for hidden in self._hidden_self_whitelist_entries:
+            hidden_path = os.path.abspath(str(hidden.get("path", "")).strip())
+            hidden_sha = str(hidden.get("sha256", "")).strip().lower()
+            if not hidden_path:
+                continue
+            exists = False
+            for existing in whitelist_items:
+                if (
+                    os.path.normcase(os.path.abspath(str(existing.get("path", "")))) == os.path.normcase(hidden_path)
+                    and str(existing.get("sha256", "")).strip().lower() == hidden_sha
+                ):
+                    exists = True
+                    break
+            if not exists:
+                whitelist_items.append({"path": hidden_path, "sha256": hidden_sha})
         PangPreferences.mem_guard_whitelist = whitelist_items
 
         if self.tab_type_combo.currentIndex() == 0:

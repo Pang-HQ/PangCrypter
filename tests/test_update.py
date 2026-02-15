@@ -47,7 +47,7 @@ def test_safe_extract_rejects_symlink_entry(tmp_path):
 
 def test_perform_update_fails_on_invalid_signature(tmp_path, monkeypatch):
     updater = AutoUpdater()
-    updater.current_version = "1.0.0.0"
+    updater.current_version = "1.0.0"
 
     zip_path = tmp_path / "PangCrypter.zip"
     sig_path = tmp_path / "PangCrypter.zip.minisig"
@@ -57,7 +57,7 @@ def test_perform_update_fails_on_invalid_signature(tmp_path, monkeypatch):
     monkeypatch.setattr(
         updater,
         "check_for_updates",
-        lambda: (True, "9.9.9.9", "https://example.invalid/update.zip", "a" * 64, "https://example.invalid/update.zip.minisig"),
+        lambda: (True, "9.9.9", "https://example.invalid/update.zip", "a" * 64, "https://example.invalid/update.zip.minisig"),
     )
     monkeypatch.setattr(updater, "download_zip", lambda *_args, **_kwargs: str(zip_path))
     monkeypatch.setattr(updater, "download_file", lambda *_args, **_kwargs: str(sig_path))

@@ -3,7 +3,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QTextCursor, QKeyEvent, QTextCharFormat, QFont
 from PyQt6.QtCore import pyqtSignal, Qt
-from ..utils.preferences import PangPreferences
 from ..utils.styles import (
     DARK_BG, DARKER_BG, PURPLE, PURPLE_HOVER, TEXT_COLOR, DISABLED_TEXT_COLOR,
     BUTTON_TEXT, WARNING_COLOR, EDITOR_FONT_SIZE_PT
@@ -191,53 +190,19 @@ class USBSelectDialog(QDialog):
         return False
 
 
-class DoubleClickPopup(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Editor Hidden")
-        self.setModal(True)
-        self.resize(420, 120)
-        self.setStyleSheet(f"""
-            background-color: {DARK_BG};
-            color: {TEXT_COLOR};
-        """)
-        self.label = QLabel("Editor hidden due to focus loss or screen recording.\nDouble click anywhere to restore.")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setStyleSheet("font-size: 14px;")
-        self.layout = QVBoxLayout()
-        self.layout.addWidget(self.label)
-        self.setLayout(self.layout)
-
-    def mouseDoubleClickEvent(self, event):
-        self.accept()
-
-
 class EditorWidget(QTextEdit):
     focusLost = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, tab_setting: str = "spaces4"):
         super().__init__()
         self._is_html_mode = False
         self._global_font_size_pt = float(EDITOR_FONT_SIZE_PT)
         self.setAcceptRichText(False)
-        self._tab_setting = PangPreferences.tab_setting
+        self._tab_setting = tab_setting
         base_font = QFont('Segoe UI', int(round(self._global_font_size_pt)))
         base_font.setPointSizeF(self._global_font_size_pt)
         self.setFont(base_font)
         self.document().setDefaultFont(base_font)
-        self.setStyleSheet(f"""
-            QTextEdit {{
-                background-color: {DARK_BG};
-                color: {TEXT_COLOR};
-                border: 1px solid {PURPLE};
-                border-radius: 6px;
-                padding: 8px;
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            }}
-            QTextEdit:focus {{
-                border-color: {PURPLE_HOVER};
-            }}
-        """)
 
         # shortcut map
         self.shortcut_map = {
@@ -297,27 +262,6 @@ class EditorWidget(QTextEdit):
 
         dec_font_action = menu.addAction("Decrease Font Size")
         dec_font_action.triggered.connect(lambda: self.change_font_size(-1))
-
-        # Apply Pang theme stylesheet to menu
-        menu.setStyleSheet(f"""
-            QMenu {{
-                background-color: {DARK_BG};
-                color: {TEXT_COLOR};
-                border: 1px solid {PURPLE};
-                padding: 5px;
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                font-size: 12px;
-            }}
-            QMenu::item {{
-                padding: 4px 20px 4px 24px;
-            }}
-            QMenu::item:selected {{
-                background-color: {PURPLE_HOVER};
-            }}
-            QMenu::item:disabled {{
-                color: {DISABLED_TEXT_COLOR};
-            }}
-        """)
 
         menu.exec(event.globalPos())
 

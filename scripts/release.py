@@ -2,7 +2,7 @@
 Release automation script for PangCrypter.
 
 Flow:
-1) Prompt for version (IP-style, 4 parts, max 2 digits each)
+1) Prompt for version (semantic-style, 3 parts, max 2 digits each)
 2) Update version.txt and pangcrypter/__init__.py
 3) Run scripts/build.py
 4) Generate SHA-256 checksum for dist/PangCrypter.zip
@@ -66,14 +66,14 @@ def restore_version_files(backup: BackupFiles) -> None:
 def parse_current_version() -> str:
     text = read_file(INIT_FILE)
     match = re.search(r"__version__\s*=\s*[\"']([0-9\.]+)[\"']", text)
-    return match.group(1) if match else "0.0.0.0"
+    return match.group(1) if match else "0.0.0"
 
 
 def prompt_version(current: str) -> str:
-    print(f"Input version number (Current: {current}): __.__.__.__")
+    print(f"Input version number (Current: {current}): __.__.__")
     while True:
         parts = []
-        for i in range(4):
+        for i in range(3):
             while True:
                 raw = input(f"Part {i + 1} (0-99): ").strip()
                 if not raw.isdigit():
@@ -96,8 +96,8 @@ def prompt_version(current: str) -> str:
 
 def validate_version_or_raise(version: str) -> str:
     parts = version.split(".")
-    if len(parts) != 4:
-        raise RuntimeError("Version must have 4 dot-separated parts (e.g. 1.0.0.1)")
+    if len(parts) != 3:
+        raise RuntimeError("Version must have 3 dot-separated parts (e.g. 1.2.0)")
     for idx, raw in enumerate(parts, start=1):
         if not raw.isdigit():
             raise RuntimeError(f"Version part {idx} must be numeric")
@@ -109,7 +109,7 @@ def validate_version_or_raise(version: str) -> str:
 
 def update_version_txt(content: str, version: str) -> str:
     parts = version.split(".")
-    version_tuple = ", ".join(parts)
+    version_tuple = ", ".join(parts + ["0"])
     content = re.sub(r"filevers=\([^\)]*\)", f"filevers=({version_tuple})", content)
     content = re.sub(r"prodvers=\([^\)]*\)", f"prodvers=({version_tuple})", content)
     content = re.sub(r"FileVersion',\s*'[^']*'", f"FileVersion', '{version}'", content)
@@ -340,7 +340,7 @@ def confirm_publish(auto_confirm: bool = False) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="PangCrypter release automation")
     parser.add_argument("--fullpublish", action="store_true", help="Publish immediately (default: draft)")
-    parser.add_argument("--version", help="Release version (format: X.X.X.X). If omitted, prompts interactively.")
+    parser.add_argument("--version", help="Release version (format: X.X.X). If omitted, prompts interactively.")
     parser.add_argument("--release-name", help="Release title shown in GitHub (default: version).")
     parser.add_argument("--yes", action="store_true", help="Auto-confirm publish prompt.")
     parser.add_argument(
