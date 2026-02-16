@@ -8,6 +8,7 @@ from nacl.bindings import (
     crypto_aead_xchacha20poly1305_ietf_decrypt
 )
 from nacl.utils import random as nacl_random
+from nacl.exceptions import CryptoError as NaClCryptoError
 from argon2.low_level import hash_secret_raw, Type
 from enum import Enum
 
@@ -219,5 +220,11 @@ def decrypt_file(input_path: str,
 
     header = data[:uuid_end]
 
-    # Decrypt using the full header (settings + salt + UUID) as Associated Data
-    return crypto_aead_xchacha20poly1305_ietf_decrypt(ciphertext, header, nonce, key)
+    # Decrypt using the full header (settings + salt + UUID) as Associated Data.
+    # Normalize low-level NaCl auth failures into ValueError so callers can
+    # consistently treat this as invalid credentials/corrupt input without
+    # crashing the UI path.
+    try:
+        return crypto_aead_xchacha20poly1305_ietf_decrypt(ciphertext, header, nonce, key)
+    except NaClCryptoError as exc:
+        raise ValueError("Decryption failed: wrong password/key or corrupted file") from exc
