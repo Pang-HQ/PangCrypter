@@ -78,7 +78,7 @@ def test_mem_guard_stop_failure_disables_until_restart(monkeypatch):
 
 def test_mem_guard_normal_write_trusted_system_is_log_only(monkeypatch):
     process_path = r"C:\Windows\System32\trusted.exe"
-    stat_key = (process_path, 1, 2)
+    stat_key = (mem_guard._normalize_path(process_path), 1, 2)
 
     class _Proc:
         def name(self):
@@ -89,7 +89,7 @@ def test_mem_guard_normal_write_trusted_system_is_log_only(monkeypatch):
 
     monkeypatch.setattr(mem_guard.psutil, "Process", lambda _pid: _Proc())
     monkeypatch.setattr(mem_guard.os.path, "exists", lambda _p: True)
-    monkeypatch.setattr(mem_guard.os, "stat", lambda _p: SimpleNamespace(st_mtime=1, st_size=2))
+    monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
     monkeypatch.setattr(mem_guard, "_is_windows_system_path", lambda _p: True)
 
     signature_cache = {stat_key: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0)}
@@ -110,7 +110,7 @@ def test_mem_guard_normal_write_trusted_system_is_log_only(monkeypatch):
 
 def test_mem_guard_normal_read_trusted_non_system_alerts(monkeypatch):
     process_path = r"C:\Tools\overlay.exe"
-    stat_key = (process_path, 1, 2)
+    stat_key = (mem_guard._normalize_path(process_path), 1, 2)
 
     class _Proc:
         def name(self):
@@ -121,7 +121,7 @@ def test_mem_guard_normal_read_trusted_non_system_alerts(monkeypatch):
 
     monkeypatch.setattr(mem_guard.psutil, "Process", lambda _pid: _Proc())
     monkeypatch.setattr(mem_guard.os.path, "exists", lambda _p: True)
-    monkeypatch.setattr(mem_guard.os, "stat", lambda _p: SimpleNamespace(st_mtime=1, st_size=2))
+    monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
     monkeypatch.setattr(mem_guard, "_is_windows_system_path", lambda _p: False)
 
     signature_cache = {stat_key: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0)}
@@ -142,7 +142,7 @@ def test_mem_guard_normal_read_trusted_non_system_alerts(monkeypatch):
 
 def test_mem_guard_ultra_aggressive_keeps_write_only(monkeypatch):
     process_path = r"C:\Temp\proc.exe"
-    stat_key = (process_path, 1, 2)
+    stat_key = (mem_guard._normalize_path(process_path), 1, 2)
 
     class _Proc:
         def name(self):
@@ -153,7 +153,7 @@ def test_mem_guard_ultra_aggressive_keeps_write_only(monkeypatch):
 
     monkeypatch.setattr(mem_guard.psutil, "Process", lambda _pid: _Proc())
     monkeypatch.setattr(mem_guard.os.path, "exists", lambda _p: True)
-    monkeypatch.setattr(mem_guard.os, "stat", lambda _p: SimpleNamespace(st_mtime=1, st_size=2))
+    monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
 
     signature_cache = {stat_key: mem_guard.SigResult(mem_guard.SigTrust.UNKNOWN, 0)}
     hash_cache = {stat_key: "abc"}
@@ -222,11 +222,82 @@ def test_parent_lineage_program_files_trusted_not_suspicious(monkeypatch):
 
     monkeypatch.setattr(mem_guard.psutil, "Process", _proc_factory)
     monkeypatch.setattr(mem_guard.os.path, "exists", lambda _p: True)
-    monkeypatch.setattr(mem_guard.os, "stat", lambda _p: SimpleNamespace(st_mtime=1, st_size=2))
+    monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
     monkeypatch.setattr(mem_guard, "_is_windows_system_path", lambda _p: False)
-    monkeypatch.setattr(mem_guard, "_is_program_files_path", lambda _p: True)
     monkeypatch.setattr(mem_guard, "_signature_status_with_fallback", lambda _p: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0))
 
     suspicious, lineage = mem_guard._assess_parent_lineage(100, {})
     assert suspicious is False
     assert "Code.exe" in lineage
+
+
+def test_enrich_pid_finding_uses_normalized_stat_cache_key(monkeypatch):
+    process_path = r"C:\Temp\Example.EXE"
+    normalized_path = process_path.lower()
+    stat_key = (normalized_path, 1, 2)
+
+    class _Proc:
+        def name(self):
+            return "Example.exe"
+
+        def exe(self):
+            return process_path
+
+    monkeypatch.setattr(mem_guard.psutil, "Process", lambda _pid: _Proc())
+    monkeypatch.setattr(mem_guard.os.path, "exists", lambda _p: True)
+    monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
+
+    signature_cache = {stat_key: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0)}
+    hash_cache = {}
+
+    finding = mem_guard.enrich_pid_finding(
+        777,
+        mem_guard.PROCESS_VM_READ,
+        mem_guard.MemGuardMode.NORMAL,
+        [],
+        signature_cache,
+        hash_cache,
+    )
+
+    assert finding is not None
+    assert finding.sig_trust == mem_guard.SigTrust.SIGNED_TRUSTED
+
+
+def test_enrich_pid_finding_skips_sha256_when_no_whitelist_hash(monkeypatch):
+    process_path = r"C:\Temp\proc.exe"
+
+    class _Proc:
+        def name(self):
+            return "proc.exe"
+
+        def exe(self):
+            return process_path
+
+    monkeypatch.setattr(mem_guard.psutil, "Process", lambda _pid: _Proc())
+    monkeypatch.setattr(mem_guard.os.path, "exists", lambda _p: True)
+    monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
+    monkeypatch.setattr(mem_guard, "_is_windows_system_path", lambda _p: False)
+    monkeypatch.setattr(mem_guard, "_signature_status_with_fallback", lambda _p: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0))
+
+    called = {"sha": 0}
+
+    def _sha(_path):
+        called["sha"] += 1
+        return "abc"
+
+    monkeypatch.setattr(mem_guard, "file_sha256", _sha)
+
+    signature_cache = {}
+    hash_cache = {}
+
+    finding = mem_guard.enrich_pid_finding(
+        888,
+        mem_guard.PROCESS_VM_READ,
+        mem_guard.MemGuardMode.NORMAL,
+        [],
+        signature_cache,
+        hash_cache,
+    )
+
+    assert finding is not None
+    assert called["sha"] == 0

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import platform
+import random
 from dataclasses import dataclass
 from enum import Enum
 from ctypes import wintypes
@@ -201,28 +202,6 @@ def _normalize_path(path: str) -> str:
     if not path:
         return ""
     return os.path.normcase(os.path.abspath(path))
-
-
-def _is_program_files_path(path: str) -> bool:
-    if not path:
-        return False
-    npath = _normalize_path(path)
-    program_files_roots = [
-        os.environ.get("ProgramFiles", r"C:\Program Files"),
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-    ]
-    for root in program_files_roots:
-        if not root:
-            continue
-        nroot = _normalize_path(root)
-        if npath == nroot or npath.startswith(nroot + os.sep):
-            return True
-    return False
-
-
-def is_path_whitelisted(process_path: str, whitelist: list[str]) -> bool:
-    normalized = _normalize_path(process_path)
-    return bool(normalized) and normalized in {_normalize_path(p) for p in whitelist}
 
 
 def _signature_status_windows(path: str, *, cache_only: bool = True) -> SigResult:
@@ -677,26 +656,66 @@ def estimate_scan_time_ms(
     return total_ms / n
 
 
-def _is_whitelisted(process_path: str, process_sha256: str, whitelist: list[dict | str]) -> bool:
-    if not process_path:
-        return False
+def _build_stat_key(process_path: str) -> tuple[str, int, int] | None:
+    if not process_path or not os.path.exists(process_path):
+        return None
     normalized_path = _normalize_path(process_path)
+    try:
+        st = os.stat(process_path)
+        return (normalized_path, int(st.st_mtime), int(st.st_size))
+    except OSError:
+        return None
+
+
+def _compute_or_get_hash(
+    *,
+    stat_key: tuple[str, int, int] | None,
+    process_path: str,
+    hash_cache: dict[tuple[str, int, int], str],
+) -> str:
+    if not stat_key:
+        return ""
+    process_hash = hash_cache.get(stat_key, "")
+    if process_hash:
+        return process_hash
+    process_hash = file_sha256(process_path)
+    hash_cache[stat_key] = process_hash
+    return process_hash
+
+
+def _whitelist_requirements_for_path(
+    process_path: str,
+    whitelist: list[dict | str],
+) -> tuple[bool, set[str], bool]:
+    """Return (path_matched, allowed_hashes, has_unpinned_match)."""
+    normalized_path = _normalize_path(process_path)
+    if not normalized_path:
+        return False, set(), False
+
+    path_matched = False
+    allowed_hashes: set[str] = set()
+    has_unpinned_match = False
+
     for item in whitelist:
         if isinstance(item, str):
             entry_path = _normalize_path(item)
             entry_sha = ""
         elif isinstance(item, dict):
             entry_path = _normalize_path(str(item.get("path", "")))
-            entry_sha = str(item.get("sha256", "")).lower()
+            entry_sha = str(item.get("sha256", "")).strip().lower()
         else:
             continue
 
-        if normalized_path != entry_path:
+        if entry_path != normalized_path:
             continue
-        if entry_sha and process_sha256:
-            return entry_sha == process_sha256.lower()
-        return True
-    return False
+
+        path_matched = True
+        if entry_sha:
+            allowed_hashes.add(entry_sha)
+        else:
+            has_unpinned_match = True
+
+    return path_matched, allowed_hashes, has_unpinned_match
 
 
 def _is_windows_system_path(path: str) -> bool:
@@ -743,12 +762,8 @@ def _is_user_writable_path(path: str) -> bool:
 
 
 def _cached_sig_for_path(process_path: str, signature_cache: dict[tuple[str, int, int], SigResult]) -> SigResult:
-    if not process_path or not os.path.exists(process_path):
-        return SigResult(SigTrust.UNKNOWN, 0)
-    try:
-        st = os.stat(process_path)
-        stat_key = (process_path, int(st.st_mtime), int(st.st_size))
-    except OSError:
+    stat_key = _build_stat_key(process_path)
+    if not stat_key:
         return SigResult(SigTrust.UNKNOWN, 0)
 
     if stat_key in signature_cache:
@@ -816,36 +831,31 @@ def enrich_pid_finding(
         process_name = f"pid-{owner_pid}"
         process_path = ""
 
+    access_int = int(access)
+    has_read = _has_vm_read(access_int)
+    has_write_or_op = _has_vm_write_or_op(access_int)
+
     stat_key: tuple[str, int, int] | None = None
     process_hash = ""
     sig = SigResult(SigTrust.UNKNOWN, 0)
-    if process_path and os.path.exists(process_path):
-        try:
-            st = os.stat(process_path)
-            stat_key = (process_path, int(st.st_mtime), int(st.st_size))
-        except OSError:
-            stat_key = None
+    stat_key = _build_stat_key(process_path)
 
     if stat_key:
-        process_hash = hash_cache.get(stat_key, "")
-        if not process_hash:
-            process_hash = file_sha256(process_path)
-            hash_cache[stat_key] = process_hash
-
         sig = signature_cache.get(stat_key, SigResult(SigTrust.UNKNOWN, 0))
         if stat_key not in signature_cache:
             sig = _signature_status_with_fallback(process_path)
             signature_cache[stat_key] = sig
 
-    if _is_whitelisted(process_path, process_hash, whitelist):
+    path_matched, allowed_hashes, has_unpinned_whitelist = _whitelist_requirements_for_path(process_path, whitelist)
+    if has_unpinned_whitelist:
         _log_decision(
             mode=mode,
             pid=owner_pid,
             process_name=process_name,
             process_path=process_path,
-            access_mask=int(access),
-            has_read=_has_vm_read(int(access)),
-            has_write_or_op=_has_vm_write_or_op(int(access)),
+            access_mask=access_int,
+            has_read=has_read,
+            has_write_or_op=has_write_or_op,
             sig=sig,
             process_hash=process_hash,
             decision="whitelisted",
@@ -856,14 +866,40 @@ def enrich_pid_finding(
             pid=owner_pid,
             process_name=process_name,
             process_path=process_path,
-            access_mask=f"0x{int(access):08x}",
+            access_mask=f"0x{access_int:08x}",
             sig_trust=sig.trust.value,
         )
         return None
+    if path_matched and allowed_hashes:
+        process_hash = _compute_or_get_hash(stat_key=stat_key, process_path=process_path, hash_cache=hash_cache)
+        if process_hash and process_hash.lower() in allowed_hashes:
+            _log_decision(
+                mode=mode,
+                pid=owner_pid,
+                process_name=process_name,
+                process_path=process_path,
+                access_mask=access_int,
+                has_read=has_read,
+                has_write_or_op=has_write_or_op,
+                sig=sig,
+                process_hash=process_hash,
+                decision="whitelisted",
+                reason="Path/hash matches configured mem-guard whitelist",
+            )
+            _emit_telemetry(
+                "suppressed_whitelist",
+                pid=owner_pid,
+                process_name=process_name,
+                process_path=process_path,
+                access_mask=f"0x{access_int:08x}",
+                sig_trust=sig.trust.value,
+            )
+            return None
 
-    access_int = int(access)
-    has_read = _has_vm_read(access_int)
-    has_write_or_op = _has_vm_write_or_op(access_int)
+    # Compute file hash lazily for alert findings (useful for user-driven whitelist actions).
+    if stat_key and not process_hash:
+        if mode != MemGuardMode.NORMAL or has_write_or_op or (_is_suspicious_signer(sig) and has_read):
+            process_hash = _compute_or_get_hash(stat_key=stat_key, process_path=process_path, hash_cache=hash_cache)
 
     if mode == MemGuardMode.NORMAL:
         if has_write_or_op:
@@ -1180,6 +1216,40 @@ class MemGuardChecker(QObject):
         self._scan_stats = MemGuardScanStats()
         self._alert_cooldown_sec = max(0, int(alert_cooldown_sec))
         self._last_alert_at: dict[tuple[int, FindingSeverity], float] = {}
+        self._finding_cache_ttl_sec = 2.0
+        self._finding_cache_jitter_ratio = 0.25
+        self._finding_cache: dict[tuple[int, int], tuple[float, MemGuardFinding | None]] = {}
+
+    def _next_finding_cache_ttl(self) -> float:
+        base = max(0.1, float(self._finding_cache_ttl_sec))
+        jitter = max(0.0, float(self._finding_cache_jitter_ratio))
+        low = max(0.1, base * (1.0 - jitter))
+        high = max(low, base * (1.0 + jitter))
+        return random.uniform(low, high)
+
+    def _get_enriched_finding_cached(self, owner_pid: int, access: int) -> MemGuardFinding | None:
+        key = (int(owner_pid), int(access))
+        now = monotonic()
+        cached = self._finding_cache.get(key)
+        if cached and now < cached[0]:
+            return cached[1]
+
+        finding = enrich_pid_finding(
+            owner_pid,
+            access,
+            self.mode,
+            self.whitelist,
+            self._signature_cache,
+            self._hash_cache,
+        )
+        self._finding_cache[key] = (now + self._next_finding_cache_ttl(), finding)
+
+        if len(self._finding_cache) > 4096:
+            expired_keys = [k for k, (expires_at, _v) in self._finding_cache.items() if expires_at <= now]
+            for expired_key in expired_keys[:1024]:
+                self._finding_cache.pop(expired_key, None)
+
+        return finding
 
     def _should_emit_alert(self, pid: int, severity: FindingSeverity) -> bool:
         if self._alert_cooldown_sec <= 0:
@@ -1204,9 +1274,10 @@ class MemGuardChecker(QObject):
         self._pid_handle_cache.close_all(CloseHandle)
 
     def run(self):
+        interval_sec = self.check_interval_ms / 1000.0
+        next_deadline = monotonic()
         while self.running:
             try:
-                current_alertable_pids: set[int] = set()
                 owner_map, self._scan_cursor = _enumerate_reader_pids_windows(
                     os.getpid(),
                     stop_event=self._stop_event,
@@ -1219,19 +1290,11 @@ class MemGuardChecker(QObject):
                     if self._stop_event.is_set():
                         break
 
-                    finding = enrich_pid_finding(
-                        owner_pid,
-                        access,
-                        self.mode,
-                        self.whitelist,
-                        self._signature_cache,
-                        self._hash_cache,
-                    )
+                    finding = self._get_enriched_finding_cached(owner_pid, access)
                     if not finding:
                         continue
                     if finding.disposition != FindingDisposition.ALERT:
                         continue
-                    current_alertable_pids.add(finding.pid)
                     if not self._should_emit_alert(finding.pid, finding.severity):
                         _emit_telemetry(
                             "suppressed_debounce",
@@ -1249,7 +1312,16 @@ class MemGuardChecker(QObject):
             except (OSError, RuntimeError, ValueError, psutil.Error) as e:
                 logger.debug("Memory guard scan failed: %s", e)
 
-            if self._stop_event.wait(self.check_interval_ms / 1000.0):
-                break
+            next_deadline += interval_sec
+            remaining = next_deadline - monotonic()
+            if remaining > 0:
+                if self._stop_event.wait(remaining):
+                    break
+            else:
+                # If scan runtime overruns the configured interval, resync schedule to
+                # avoid a tight catch-up loop while preserving fixed-rate cadence.
+                next_deadline = monotonic()
+                if self._stop_event.is_set():
+                    break
 
         self.close_resources()
