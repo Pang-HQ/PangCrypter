@@ -160,10 +160,6 @@ bandit -r pangcrypter
 pip-audit -r requirements.txt
 ```
 
-Developer security and release process:
-
-- `docs/DEVELOPER_SECURITY_RELEASE.md`
-
 ## Contributing
 
 Contributions are welcome. Please open an issue before large changes.
