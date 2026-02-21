@@ -10,6 +10,10 @@ Flow:
 6) Create release notes draft and open in VS Code
 7) Publish GitHub release via gh (draft by default, --fullpublish for immediate)
 8) Roll back version files if publishing is cancelled or fails
+
+Resume mode:
+- Use --continue-release to publish an already-prepared release without rebuilding
+  or regenerating release-notes/checksum/signature artifacts.
 """
 
 from __future__ import annotations
@@ -322,6 +326,39 @@ def git_commit_tag_push(version: str, commit_message: str, push_git: bool) -> No
             raise RuntimeError(f"Failed to push git tag {tag}.")
 
 
+def _local_tag_exists(tag: str) -> bool:
+    result = subprocess.run(["git", "tag", "--list", tag], capture_output=True, text=True)
+    return result.returncode == 0 and tag in result.stdout.split()
+
+
+def _remote_tag_exists(tag: str, remote: str = "origin") -> bool:
+    result = subprocess.run(
+        ["git", "ls-remote", "--tags", remote, f"refs/tags/{tag}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def ensure_release_tag_on_remote(version: str, remote: str = "origin") -> None:
+    """Ensure release tag exists on remote before gh release create.
+
+    Handles the common case where a tag exists locally but wasn't pushed yet.
+    """
+    tag = f"v{version}"
+    if _remote_tag_exists(tag, remote=remote):
+        return
+
+    if _local_tag_exists(tag):
+        print(f"\n▶ Pushing existing local tag {tag} to {remote}...")
+        pushed = subprocess.run(["git", "push", remote, tag])
+        if pushed.returncode != 0:
+            raise RuntimeError(
+                f"Tag {tag} exists locally but could not be pushed to {remote}. "
+                "Push manually or provide --target to create a fresh remote tag target."
+            )
+
+
 def publish_release(
     gh_bin: str,
     version: str,
@@ -331,6 +368,7 @@ def publish_release(
     minisig_path: Path,
     notes_path: Path,
     full_publish: bool,
+    target: Optional[str] = None,
 ) -> None:
     tag = f"v{version}"
     cmd = [
@@ -343,6 +381,8 @@ def publish_release(
     ]
     if not full_publish:
         cmd.append("--draft")
+    if target:
+        cmd.extend(["--target", target])
 
     print("\n▶ Publishing GitHub release...")
     result = subprocess.run(cmd)
@@ -373,12 +413,24 @@ def confirm_publish(auto_confirm: bool = False) -> bool:
     return confirm == "y"
 
 
+def confirm_version(version: str, auto_confirm: bool = False) -> bool:
+    if auto_confirm:
+        return True
+    confirm = input(f"\nContinue release for version {version}? [Y/N]: ").strip().lower()
+    return confirm == "y"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="PangCrypter release automation")
     parser.add_argument("--fullpublish", action="store_true", help="Publish immediately (default: draft)")
     parser.add_argument("--version", help="Release version (format: X.X.X). If omitted, prompts interactively.")
     parser.add_argument("--release-name", help="Release title shown in GitHub (default: version).")
     parser.add_argument("--yes", action="store_true", help="Auto-confirm publish prompt.")
+    parser.add_argument(
+        "--continue-release",
+        action="store_true",
+        help="Continue an already-prepared release (skip build/artifact generation and keep existing release notes).",
+    )
     parser.add_argument(
         "--skip-git",
         action="store_true",
@@ -410,6 +462,10 @@ def main() -> int:
         "--minisign-password",
         help="Password for encrypted minisign secret key (or set PANGCRYPTER_MINISIGN_PASSWORD).",
     )
+    parser.add_argument(
+        "--target",
+        help="Optional commit/branch target for gh release tag creation (passed to gh release create --target).",
+    )
     args = parser.parse_args()
 
     backup = backup_version_files()
@@ -417,6 +473,53 @@ def main() -> int:
         current_version = parse_current_version()
         version = validate_version_or_raise(args.version) if args.version else prompt_version(current_version)
         release_name = args.release_name or version
+
+        if args.continue_release:
+            if version != current_version:
+                raise RuntimeError(
+                    f"--continue-release requires version {current_version} (current project version). "
+                    "Use normal release flow for a new version bump."
+                )
+            if not confirm_version(version, auto_confirm=args.yes):
+                raise RuntimeError("Continue-release cancelled by user.")
+
+            zip_path = DIST_DIR / ZIP_NAME
+            checksum_path = zip_path.with_suffix(zip_path.suffix + CHECKSUM_SUFFIX)
+            minisig_path = zip_path.with_suffix(zip_path.suffix + MINISIG_SUFFIX)
+            notes_path = DIST_DIR / RELEASE_NOTES_NAME
+
+            for required in (zip_path, checksum_path, minisig_path, notes_path):
+                if not required.exists():
+                    raise RuntimeError(
+                        f"Missing required prepared artifact for --continue-release: {required}"
+                    )
+
+            gh_bin = resolve_binary("gh", env_override_key="PANGCRYPTER_GH_PATH")
+            ensure_gh_cli(gh_bin)
+
+            if not confirm_publish(auto_confirm=args.yes):
+                raise RuntimeError("Publish cancelled by user.")
+
+            if not args.skip_git:
+                ensure_git_cli()
+                commit_message = args.git_commit_message or f"chore(release): prepare v{version}"
+                git_commit_tag_push(version, commit_message=commit_message, push_git=args.push_git)
+
+            publish_release(
+                gh_bin,
+                version,
+                release_name,
+                zip_path,
+                checksum_path,
+                minisig_path,
+                notes_path,
+                args.fullpublish,
+                target=args.target,
+            )
+            print_release_summary(gh_bin, version)
+
+            print("\n✅ Release published successfully (continue mode).")
+            return 0
 
         print("\n▶ Updating version files...")
         version_txt = update_version_txt(backup.version_text, version)
@@ -477,6 +580,8 @@ def main() -> int:
             commit_message = args.git_commit_message or f"chore(release): prepare v{version}"
             git_commit_tag_push(version, commit_message=commit_message, push_git=args.push_git)
 
+        ensure_release_tag_on_remote(version)
+
         publish_release(
             gh_bin,
             version,
@@ -486,6 +591,7 @@ def main() -> int:
             minisig_path,
             notes_path,
             args.fullpublish,
+            target=args.target,
         )
         print_release_summary(gh_bin, version)
 
