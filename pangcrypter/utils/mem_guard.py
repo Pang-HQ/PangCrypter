@@ -6,7 +6,7 @@ import os
 import platform
 import random
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, auto
 from ctypes import wintypes
 from threading import Event
 from collections import OrderedDict
@@ -19,27 +19,27 @@ logger = logging.getLogger(__name__)
 
 
 class MemGuardMode(Enum):
-    OFF = "off"
-    NORMAL = "normal"
-    ULTRA_AGGRESSIVE = "ultra_aggressive"
+    OFF = auto()
+    NORMAL = auto()
+    ULTRA_AGGRESSIVE = auto()
 
 
 class SigTrust(Enum):
-    UNSIGNED = "unsigned"
-    SIGNED_TRUSTED = "trusted"
-    SIGNED_UNTRUSTED = "untrusted"
-    UNKNOWN = "unknown"
+    UNSIGNED = auto()
+    SIGNED_TRUSTED = auto()
+    SIGNED_UNTRUSTED = auto()
+    UNKNOWN = auto()
 
 
 class FindingSeverity(Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
+    LOW = auto()
+    MEDIUM = auto()
+    HIGH = auto()
 
 
 class FindingDisposition(Enum):
-    ALERT = "alert"
-    LOG_ONLY = "log_only"
+    ALERT = auto()
+    LOG_ONLY = auto()
 
 
 @dataclass(frozen=True)
@@ -60,6 +60,29 @@ class MemGuardFinding:
     severity: FindingSeverity
     disposition: FindingDisposition
     reason: str
+
+
+@dataclass(frozen=True)
+class DecisionLogContext:
+    mode: MemGuardMode
+    pid: int
+    process_name: str
+    process_path: str
+    access_mask: int
+    has_read: bool
+    has_write_or_op: bool
+    sig: SigResult
+    process_hash: str
+
+
+@dataclass(frozen=True)
+class DecisionLogEvent:
+    context: DecisionLogContext
+    decision: str
+    reason: str
+    lineage: str = ""
+    severity: FindingSeverity | None = None
+    disposition: FindingDisposition | None = None
 
 
 @dataclass
@@ -149,22 +172,27 @@ def _emit_telemetry(event: str, **fields) -> None:
 
 
 def _log_decision(
+    event_or_context: DecisionLogEvent | DecisionLogContext,
     *,
-    mode: MemGuardMode,
-    pid: int,
-    process_name: str,
-    process_path: str,
-    access_mask: int,
-    has_read: bool,
-    has_write_or_op: bool,
-    sig: SigResult,
-    process_hash: str,
-    decision: str,
-    reason: str,
+    decision: str | None = None,
+    reason: str | None = None,
     lineage: str = "",
     severity: FindingSeverity | None = None,
     disposition: FindingDisposition | None = None,
 ) -> None:
+    if isinstance(event_or_context, DecisionLogEvent):
+        event = event_or_context
+    else:
+        event = DecisionLogEvent(
+            context=event_or_context,
+            decision=decision or "unknown",
+            reason=reason or "",
+            lineage=lineage,
+            severity=severity,
+            disposition=disposition,
+        )
+
+    context = event.context
     logger.info(
         (
             "MemGuard decision=%s mode=%s pid=%s name=%r path=%r "
@@ -172,21 +200,21 @@ def _log_decision(
             "sig_trust=%s winverifytrust_status=0x%08x sha256=%s "
             "severity=%s disposition=%s lineage=%s reason=%s"
         ),
-        decision,
-        mode.value,
-        pid,
-        process_name,
-        process_path,
-        int(access_mask),
-        has_read,
-        has_write_or_op,
-        sig.trust.value,
-        int(sig.status),
-        process_hash or "<none>",
-        severity.value if severity else "<none>",
-        disposition.value if disposition else "<none>",
-        lineage or "<none>",
-        reason,
+        event.decision,
+        context.mode.name.lower(),
+        context.pid,
+        context.process_name,
+        context.process_path,
+        int(context.access_mask),
+        context.has_read,
+        context.has_write_or_op,
+        context.sig.trust.name.lower(),
+        int(context.sig.status),
+        context.process_hash or "<none>",
+        event.severity.name.lower() if event.severity else "<none>",
+        event.disposition.name.lower() if event.disposition else "<none>",
+        event.lineage or "<none>",
+        event.reason,
     )
 
 
@@ -195,7 +223,7 @@ def is_mem_guard_supported() -> bool:
 
 
 def default_mem_guard_mode() -> str:
-    return MemGuardMode.NORMAL.value if is_mem_guard_supported() else MemGuardMode.OFF.value
+    return MemGuardMode.NORMAL.name.lower() if is_mem_guard_supported() else MemGuardMode.OFF.name.lower()
 
 
 def _normalize_path(path: str) -> str:
@@ -403,9 +431,9 @@ def _enumerate_handles_to_pid_windows(
     max_entries: int = 0,
     pid_handle_cache: PidHandleCache | None = None,
     stats: MemGuardScanStats | None = None,
-) -> tuple[list[tuple[int, int]], int]:
+) -> tuple[list[tuple[int, int]], int, int, int]:
     if not is_mem_guard_supported():
-        return [], 0
+        return [], 0, 0, 0
 
     ntdll = ctypes.WinDLL("ntdll")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -475,16 +503,16 @@ def _enumerate_handles_to_pid_windows(
         if status == STATUS_INFO_LENGTH_MISMATCH:
             size = max(size * 2, return_len.value + 0x1000)
             continue
-        return [], 0
+        return [], 0, 0, 0
     else:
-        return [], 0
+        return [], 0, 0, 0
 
     if buffer is None:
         logger.debug("MemGuard handle scan buffer allocation failed")
-        return [], 0
+        return [], 0, 0, 0
     count = ctypes.c_size_t.from_buffer_copy(buffer.raw[: ctypes.sizeof(ctypes.c_size_t)]).value
     if count <= 0:
-        return [], 0
+        return [], 0, 0, 0
 
     header_size = ctypes.sizeof(ctypes.c_size_t) * 2
     entries = ctypes.cast(
@@ -576,7 +604,7 @@ def _enumerate_handles_to_pid_windows(
         idx = (idx + 1) % count
         scanned += 1
 
-    return hits, idx
+    return hits, idx, int(count), int(scanned)
 
 
 def _enumerate_reader_pids_windows(
@@ -586,11 +614,11 @@ def _enumerate_reader_pids_windows(
     max_entries: int = 0,
     pid_handle_cache: PidHandleCache | None = None,
     stats: MemGuardScanStats | None = None,
-) -> tuple[dict[int, int], int]:
+) -> tuple[dict[int, int], int, int, int]:
     scan_started = perf_counter()
     reader_access: dict[int, int] = {}
 
-    hits, next_index = _enumerate_handles_to_pid_windows(
+    hits, next_index, total_count, scanned_count = _enumerate_handles_to_pid_windows(
         target_pid,
         stop_event=stop_event,
         start_index=start_index,
@@ -610,7 +638,7 @@ def _enumerate_reader_pids_windows(
         stats.scans += 1
         stats.runtime_ms_total += (perf_counter() - scan_started) * 1000.0
 
-    return reader_access, next_index
+    return reader_access, next_index, total_count, scanned_count
 
 
 def estimate_scan_time_ms(
@@ -620,7 +648,14 @@ def estimate_scan_time_ms(
     target_pid: int | None = None,
     inter_scan_delay_ms: int = 0,
 ) -> float | None:
-    """Estimate average mem-guard scan cost (ms) using a cached sample window."""
+    """Estimate average CPU time (ms) for one full handle-table sweep.
+
+    Notes:
+    - A "sample" is a *full* scan sweep across the current handle table.
+    - If ``max_entries`` chunks the scan, multiple internal scan calls may be
+      required to complete one sample.
+    - Sleep/delay time is intentionally excluded from the reported average.
+    """
     if not is_mem_guard_supported():
         return None
 
@@ -635,25 +670,49 @@ def estimate_scan_time_ms(
     cursor = 0
     n = max(1, int(samples))
     delay_ms = max(0, int(inter_scan_delay_ms))
-    total_ms = 0.0
+    total_work_ms = 0.0
+    full_scans_completed = 0
+
+    current_full_scan_work_ms = 0.0
+    current_full_scan_entries = 0
+
+    max_internal_calls = max(100, n * 200)
+    internal_calls = 0
 
     try:
-        for idx in range(n):
+        while full_scans_completed < n and internal_calls < max_internal_calls:
+            internal_calls += 1
+            prev_cursor = cursor
             t0 = perf_counter()
-            _, cursor = _enumerate_reader_pids_windows(
+            _, cursor, total_count, scanned_count = _enumerate_reader_pids_windows(
                 pid,
                 start_index=cursor,
                 max_entries=max_entries,
                 pid_handle_cache=cache,
                 stats=stats,
             )
-            total_ms += (perf_counter() - t0) * 1000.0
-            if delay_ms > 0 and idx < (n - 1):
+
+            work_ms = (perf_counter() - t0) * 1000.0
+            current_full_scan_work_ms += work_ms
+            current_full_scan_entries += max(0, int(scanned_count))
+
+            wrapped = bool(total_count > 0 and cursor < prev_cursor)
+            reached_full = bool(total_count > 0 and current_full_scan_entries >= int(total_count))
+
+            if total_count > 0 and (wrapped or reached_full):
+                total_work_ms += current_full_scan_work_ms
+                full_scans_completed += 1
+                current_full_scan_work_ms = 0.0
+                current_full_scan_entries = 0
+
+            if delay_ms > 0 and full_scans_completed < n:
                 sleep(delay_ms / 1000.0)
     finally:
         cache.close_all(CloseHandle)
 
-    return total_ms / n
+    if full_scans_completed <= 0:
+        return None
+    return total_work_ms / float(full_scans_completed)
 
 
 def _build_stat_key(process_path: str) -> tuple[str, int, int] | None:
@@ -802,7 +861,7 @@ def _assess_parent_lineage(owner_pid: int, signature_cache: dict[tuple[str, int,
             parent_suspicious = sig_suspicious or (path_suspicious and parent_sig.trust != SigTrust.SIGNED_TRUSTED)
 
             chain.append(
-                f"{parent_name}(pid={ppid},system={parent_is_system},sig={parent_sig.trust.value})"
+                f"{parent_name}(pid={ppid},system={parent_is_system},sig={parent_sig.trust.name.lower()})"
             )
             if parent_suspicious:
                 return True, " -> ".join(chain)
@@ -848,41 +907,29 @@ def enrich_pid_finding(
 
     path_matched, allowed_hashes, has_unpinned_whitelist = _whitelist_requirements_for_path(process_path, whitelist)
     if has_unpinned_whitelist:
-        _log_decision(
-            mode=mode,
-            pid=owner_pid,
-            process_name=process_name,
-            process_path=process_path,
-            access_mask=access_int,
-            has_read=has_read,
-            has_write_or_op=has_write_or_op,
-            sig=sig,
-            process_hash=process_hash,
-            decision="whitelisted",
-            reason="Path/hash matches configured mem-guard whitelist",
-        )
         _emit_telemetry(
-            "suppressed_whitelist",
+            "ignored_unpinned_whitelist",
             pid=owner_pid,
             process_name=process_name,
             process_path=process_path,
             access_mask=f"0x{access_int:08x}",
-            sig_trust=sig.trust.value,
+            sig_trust=sig.trust.name.lower(),
         )
-        return None
     if path_matched and allowed_hashes:
         process_hash = _compute_or_get_hash(stat_key=stat_key, process_path=process_path, hash_cache=hash_cache)
         if process_hash and process_hash.lower() in allowed_hashes:
             _log_decision(
-                mode=mode,
-                pid=owner_pid,
-                process_name=process_name,
-                process_path=process_path,
-                access_mask=access_int,
-                has_read=has_read,
-                has_write_or_op=has_write_or_op,
-                sig=sig,
-                process_hash=process_hash,
+                DecisionLogContext(
+                    mode=mode,
+                    pid=owner_pid,
+                    process_name=process_name,
+                    process_path=process_path,
+                    access_mask=access_int,
+                    has_read=has_read,
+                    has_write_or_op=has_write_or_op,
+                    sig=sig,
+                    process_hash=process_hash,
+                ),
                 decision="whitelisted",
                 reason="Path/hash matches configured mem-guard whitelist",
             )
@@ -892,7 +939,7 @@ def enrich_pid_finding(
                 process_name=process_name,
                 process_path=process_path,
                 access_mask=f"0x{access_int:08x}",
-                sig_trust=sig.trust.value,
+                sig_trust=sig.trust.name.lower(),
             )
             return None
 
@@ -925,15 +972,17 @@ def enrich_pid_finding(
             elif benign_system_inconclusive and disposition == FindingDisposition.LOG_ONLY:
                 reason += " (system-path signature inconclusive)"
             _log_decision(
-                mode=mode,
-                pid=owner_pid,
-                process_name=process_name,
-                process_path=process_path,
-                access_mask=access_int,
-                has_read=has_read,
-                has_write_or_op=has_write_or_op,
-                sig=sig,
-                process_hash=process_hash,
+                DecisionLogContext(
+                    mode=mode,
+                    pid=owner_pid,
+                    process_name=process_name,
+                    process_path=process_path,
+                    access_mask=access_int,
+                    has_read=has_read,
+                    has_write_or_op=has_write_or_op,
+                    sig=sig,
+                    process_hash=process_hash,
+                ),
                 decision="log_only" if disposition == FindingDisposition.LOG_ONLY else "detected",
                 reason=reason,
                 lineage=lineage_summary,
@@ -946,9 +995,9 @@ def enrich_pid_finding(
                 process_name=process_name,
                 process_path=process_path,
                 access_mask=f"0x{access_int:08x}",
-                sig_trust=sig.trust.value,
-                severity=severity.value,
-                disposition=disposition.value,
+                sig_trust=sig.trust.name.lower(),
+                severity=severity.name.lower(),
+                disposition=disposition.name.lower(),
                 detection_reason=reason,
             )
             return MemGuardFinding(
@@ -971,21 +1020,23 @@ def enrich_pid_finding(
                     process_name=process_name,
                     process_path=process_path,
                     access_mask=f"0x{access_int:08x}",
-                    sig_trust=sig.trust.value,
-                    severity=FindingSeverity.MEDIUM.value,
-                    disposition=FindingDisposition.ALERT.value,
+                    sig_trust=sig.trust.name.lower(),
+                    severity=FindingSeverity.MEDIUM.name.lower(),
+                    disposition=FindingDisposition.ALERT.name.lower(),
                     detection_reason=f"Handle with VM read access 0x{access:08x}",
                 )
                 _log_decision(
-                    mode=mode,
-                    pid=owner_pid,
-                    process_name=process_name,
-                    process_path=process_path,
-                    access_mask=access_int,
-                    has_read=has_read,
-                    has_write_or_op=has_write_or_op,
-                    sig=sig,
-                    process_hash=process_hash,
+                    DecisionLogContext(
+                        mode=mode,
+                        pid=owner_pid,
+                        process_name=process_name,
+                        process_path=process_path,
+                        access_mask=access_int,
+                        has_read=has_read,
+                        has_write_or_op=has_write_or_op,
+                        sig=sig,
+                        process_hash=process_hash,
+                    ),
                     decision="detected",
                     reason=f"Handle with VM read access 0x{access:08x}",
                     severity=FindingSeverity.MEDIUM,
@@ -1013,21 +1064,23 @@ def enrich_pid_finding(
                         process_name=process_name,
                         process_path=process_path,
                         access_mask=f"0x{access_int:08x}",
-                        sig_trust=sig.trust.value,
-                        severity=FindingSeverity.MEDIUM.value,
-                        disposition=FindingDisposition.ALERT.value,
+                        sig_trust=sig.trust.name.lower(),
+                        severity=FindingSeverity.MEDIUM.name.lower(),
+                        disposition=FindingDisposition.ALERT.name.lower(),
                         detection_reason=reason,
                     )
                     _log_decision(
-                        mode=mode,
-                        pid=owner_pid,
-                        process_name=process_name,
-                        process_path=process_path,
-                        access_mask=access_int,
-                        has_read=has_read,
-                        has_write_or_op=has_write_or_op,
-                        sig=sig,
-                        process_hash=process_hash,
+                        DecisionLogContext(
+                            mode=mode,
+                            pid=owner_pid,
+                            process_name=process_name,
+                            process_path=process_path,
+                            access_mask=access_int,
+                            has_read=has_read,
+                            has_write_or_op=has_write_or_op,
+                            sig=sig,
+                            process_hash=process_hash,
+                        ),
                         decision="detected",
                         reason=reason,
                         lineage=lineage_summary,
@@ -1052,21 +1105,23 @@ def enrich_pid_finding(
                     process_name=process_name,
                     process_path=process_path,
                     access_mask=f"0x{access_int:08x}",
-                    sig_trust=sig.trust.value,
+                    sig_trust=sig.trust.name.lower(),
                     suppression_reason="trusted_system_vm_read_only",
-                    severity=FindingSeverity.LOW.value,
-                    disposition=FindingDisposition.LOG_ONLY.value,
+                    severity=FindingSeverity.LOW.name.lower(),
+                    disposition=FindingDisposition.LOG_ONLY.name.lower(),
                 )
                 _log_decision(
-                    mode=mode,
-                    pid=owner_pid,
-                    process_name=process_name,
-                    process_path=process_path,
-                    access_mask=access_int,
-                    has_read=has_read,
-                    has_write_or_op=has_write_or_op,
-                    sig=sig,
-                    process_hash=process_hash,
+                    DecisionLogContext(
+                        mode=mode,
+                        pid=owner_pid,
+                        process_name=process_name,
+                        process_path=process_path,
+                        access_mask=access_int,
+                        has_read=has_read,
+                        has_write_or_op=has_write_or_op,
+                        sig=sig,
+                        process_hash=process_hash,
+                    ),
                     decision="log_only",
                     reason=f"Handle with VM read access 0x{access:08x}",
                     lineage=lineage_summary,
@@ -1093,21 +1148,23 @@ def enrich_pid_finding(
                 process_name=process_name,
                 process_path=process_path,
                 access_mask=f"0x{access_int:08x}",
-                sig_trust=sig.trust.value,
-                severity=FindingSeverity.MEDIUM.value,
-                disposition=FindingDisposition.ALERT.value,
+                sig_trust=sig.trust.name.lower(),
+                severity=FindingSeverity.MEDIUM.name.lower(),
+                disposition=FindingDisposition.ALERT.name.lower(),
                 detection_reason=f"Handle with VM read access (trusted non-system) 0x{access:08x}",
             )
             _log_decision(
-                mode=mode,
-                pid=owner_pid,
-                process_name=process_name,
-                process_path=process_path,
-                access_mask=access_int,
-                has_read=has_read,
-                has_write_or_op=has_write_or_op,
-                sig=sig,
-                process_hash=process_hash,
+                DecisionLogContext(
+                    mode=mode,
+                    pid=owner_pid,
+                    process_name=process_name,
+                    process_path=process_path,
+                    access_mask=access_int,
+                    has_read=has_read,
+                    has_write_or_op=has_write_or_op,
+                    sig=sig,
+                    process_hash=process_hash,
+                ),
                 decision="detected",
                 reason=f"Handle with VM read access (trusted non-system) 0x{access:08x}",
                 severity=FindingSeverity.MEDIUM,
@@ -1135,21 +1192,23 @@ def enrich_pid_finding(
         process_name=process_name,
         process_path=process_path,
         access_mask=f"0x{access_int:08x}",
-        sig_trust=sig.trust.value,
-        severity=severity.value,
-        disposition=disposition.value,
+        sig_trust=sig.trust.name.lower(),
+        severity=severity.name.lower(),
+        disposition=disposition.name.lower(),
         detection_reason=reason,
     )
     _log_decision(
-        mode=mode,
-        pid=owner_pid,
-        process_name=process_name,
-        process_path=process_path,
-        access_mask=access_int,
-        has_read=has_read,
-        has_write_or_op=has_write_or_op,
-        sig=sig,
-        process_hash=process_hash,
+        DecisionLogContext(
+            mode=mode,
+            pid=owner_pid,
+            process_name=process_name,
+            process_path=process_path,
+            access_mask=access_int,
+            has_read=has_read,
+            has_write_or_op=has_write_or_op,
+            sig=sig,
+            process_hash=process_hash,
+        ),
         decision="detected",
         reason=reason,
         severity=severity,
@@ -1181,7 +1240,7 @@ def find_suspicious_memory_readers(
     signature_cache: dict[tuple[str, int, int], SigResult] = {}
     hash_cache: dict[tuple[str, int, int], str] = {}
 
-    owner_map, _ = _enumerate_reader_pids_windows(target_pid)
+    owner_map, _, _total_count, _scanned_count = _enumerate_reader_pids_windows(target_pid)
     for owner_pid, access in owner_map.items():
         finding = enrich_pid_finding(owner_pid, access, mode, whitelist, signature_cache, hash_cache)
         if finding:
@@ -1219,6 +1278,9 @@ class MemGuardChecker(QObject):
         self._finding_cache_ttl_sec = 2.0
         self._finding_cache_jitter_ratio = 0.25
         self._finding_cache: dict[tuple[int, int], tuple[float, MemGuardFinding | None]] = {}
+        self._fast_scan_streak = 0
+        # Target budget for a full system handle-table sweep (best effort).
+        self._target_full_sweep_ms = 120.0
 
     def _next_finding_cache_ttl(self) -> float:
         base = max(0.1, float(self._finding_cache_ttl_sec))
@@ -1273,12 +1335,52 @@ class MemGuardChecker(QObject):
         CloseHandle.restype = ctypes.c_int
         self._pid_handle_cache.close_all(CloseHandle)
 
+    def _adjust_scan_budget(self, elapsed_ms: float, total_count: int, scanned_count: int) -> None:
+        interval_ms = float(self.check_interval_ms)
+        if interval_ms <= 0:
+            return
+
+        if total_count <= 0 or scanned_count <= 0:
+            return
+
+        target_sweep_ms = max(80.0, float(self._target_full_sweep_ms))
+        estimated_full_sweep_ms = elapsed_ms * (float(total_count) / float(max(1, scanned_count)))
+
+        # If full scan itself is slower than target, chunking cannot improve throughput.
+        # Keep full scans to avoid chunk orchestration overhead.
+        if self._max_entries_per_scan <= 0 and estimated_full_sweep_ms > target_sweep_ms:
+            self._fast_scan_streak = 0
+            return
+
+        # Too slow to complete a full sweep near target: raise chunk budget.
+        if estimated_full_sweep_ms > (target_sweep_ms * 1.10):
+            self._fast_scan_streak = 0
+            if self._max_entries_per_scan <= 0:
+                proportional = int((total_count * interval_ms) / max(1.0, target_sweep_ms))
+                self._max_entries_per_scan = max(8000, min(total_count, proportional))
+            else:
+                growth = min(2.0, max(1.10, estimated_full_sweep_ms / max(1.0, target_sweep_ms)))
+                self._max_entries_per_scan = min(total_count, max(2000, int(self._max_entries_per_scan * growth)))
+            return
+
+        # Faster than needed: gradually lower chunk budget for lower CPU overhead.
+        if self._max_entries_per_scan > 0:
+            if estimated_full_sweep_ms < (target_sweep_ms * 0.70):
+                self._fast_scan_streak += 1
+                self._max_entries_per_scan = max(2000, int(self._max_entries_per_scan * 0.90))
+                if self._fast_scan_streak >= 10 and self._max_entries_per_scan >= int(total_count * 0.90):
+                    self._max_entries_per_scan = 0
+                    self._fast_scan_streak = 0
+            else:
+                self._fast_scan_streak = 0
+
     def run(self):
         interval_sec = self.check_interval_ms / 1000.0
         next_deadline = monotonic()
         while self.running:
             try:
-                owner_map, self._scan_cursor = _enumerate_reader_pids_windows(
+                cycle_started = perf_counter()
+                owner_map, self._scan_cursor, total_count, scanned_count = _enumerate_reader_pids_windows(
                     os.getpid(),
                     stop_event=self._stop_event,
                     start_index=self._scan_cursor,
@@ -1302,13 +1404,19 @@ class MemGuardChecker(QObject):
                             process_name=finding.process_name,
                             process_path=finding.process_path,
                             access_mask=f"0x{finding.access_mask:08x}",
-                            sig_trust=finding.sig_trust.value,
-                            severity=finding.severity.value,
-                            disposition=finding.disposition.value,
+                            sig_trust=finding.sig_trust.name.lower(),
+                            severity=finding.severity.name.lower(),
+                            disposition=finding.disposition.name.lower(),
                             suppression_reason="alert_cooldown",
                         )
                         continue
                     self.memory_probe_detected.emit(finding)
+                elapsed_ms = (perf_counter() - cycle_started) * 1000.0
+                self._adjust_scan_budget(
+                    elapsed_ms,
+                    total_count=total_count,
+                    scanned_count=scanned_count,
+                )
             except (OSError, RuntimeError, ValueError, psutil.Error) as e:
                 logger.debug("Memory guard scan failed: %s", e)
 

@@ -49,6 +49,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Main script entry point - use run.py which handles imports properly
 entry_file = os.path.join(project_root, "run.py")
+helper_entry_file = os.path.join(project_root, "pangcrypter", "tools", "apply_update_main.py")
 
 pyinstaller_args = [
     entry_file,
@@ -79,6 +80,17 @@ else:
 # PyInstaller build
 PyInstaller.__main__.run(pyinstaller_args)
 
+# Build external update helper used for Windows-safe atomic apply flow.
+helper_pyinstaller_args = [
+    helper_entry_file,
+    "--name", "PangApplyUpdate",
+    "--onefile",
+    "--console",
+    "--noconfirm",
+]
+
+PyInstaller.__main__.run(helper_pyinstaller_args)
+
 # Create ZIP distribution with proper folder structure (onedir bundle)
 import zipfile
 
@@ -88,6 +100,13 @@ pangcrypter_folder = "PangCrypter"
 
 if os.path.exists(dist_dir):
     bundle_dir = os.path.join(dist_dir, pangcrypter_folder)
+
+    helper_name = "PangApplyUpdate.exe" if os.name == "nt" else "PangApplyUpdate"
+    helper_dist_path = os.path.join(dist_dir, helper_name)
+    if os.path.isfile(helper_dist_path) and os.path.isdir(bundle_dir):
+        shutil.copy2(helper_dist_path, os.path.join(bundle_dir, helper_name))
+    else:
+        print(f"⚠️ update helper binary not found at {helper_dist_path}; auto-update handoff may fail.")
 
     # Add bundled minisign binary for updater signature verification
     minisign_src = resolve_minisign_for_bundle()

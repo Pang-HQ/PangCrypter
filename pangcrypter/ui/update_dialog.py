@@ -7,71 +7,28 @@ import os
 import logging
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QProgressBar, QWidget, QInputDialog, QApplication
+    QProgressBar, QWidget, QApplication
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 
-from ..core.updater import AutoUpdater, UpdaterError
 from ..utils.styles import TEXT_COLOR, DARKER_BG, PURPLE, DARK_BG
 from .messagebox import PangMessageBox
-from ..utils.admin import run_as_admin, is_running_as_admin
 
 logger = logging.getLogger(__name__)
-
-
-class RollbackWorker(QThread):
-    progress_updated = pyqtSignal(int, str)
-    rollback_completed = pyqtSignal(bool, str)
-
-    def __init__(self, updater: AutoUpdater, version):
-        super().__init__()
-        self.updater = updater
-        self.version = version
-
-    def run(self):
-        try:
-            zip_url, checksum, minisig_url = self.updater.get_zip_url_for_version(self.version)
-            if not zip_url:
-                self.rollback_completed.emit(False, f"No ZIP found for version {self.version}")
-                return
-
-            # download zip
-            def progress_cb(p, msg):
-                self.progress_updated.emit(p, msg)
-
-            zip_path = self.updater.download_zip(zip_url, progress_cb)
-            sig_path = None
-            if minisig_url:
-                sig_path = self.updater.download_file(minisig_url, ".minisig")
-
-            # verify zip
-            if checksum and not self.updater.verify_sha256(zip_path, checksum):
-                raise UpdaterError("SHA-256 checksum verification failed")
-            if self.updater.REQUIRE_MINISIGN:
-                if not sig_path:
-                    raise UpdaterError("Missing minisign signature for rollback package")
-                if not self.updater.verify_minisign(zip_path, sig_path):
-                    raise UpdaterError("minisign verification failed")
-            if not self.updater.verify_zip(zip_path):
-                raise UpdaterError("ZIP verification failed")
-
-            # install zip
-            self.updater.install_zip_update(zip_path)
-            self.rollback_completed.emit(True, f"Rollback to {self.version} successful!")
-        except (UpdaterError, OSError, ValueError, RuntimeError) as e:
-            self.rollback_completed.emit(False, str(e))
 
 
 class UpdateWorker(QThread):
     progress_updated = pyqtSignal(int, str)
     update_completed = pyqtSignal(bool, str)
 
-    def __init__(self, updater: AutoUpdater):
+    def __init__(self, updater):
         super().__init__()
         self.updater = updater
 
     def run(self):
         try:
+            from ..core.updater import UpdaterError
+
             def cb(p, msg):
                 self.progress_updated.emit(p, msg)
 
@@ -93,7 +50,7 @@ class UpdateDialog(QDialog):
         self.setModal(True)
         self.resize(560, 380)
 
-        self.updater = AutoUpdater()
+        self.updater = None
         self.update_worker = None
 
         self._setup_ui()
@@ -111,6 +68,13 @@ class UpdateDialog(QDialog):
         if "checksum" in lowered or "sha-256" in lowered:
             return f"Checksum verification error: {text}"
         return text
+
+    def _ensure_updater(self):
+        if self.updater is not None:
+            return self.updater
+        from ..core.updater import AutoUpdater
+        self.updater = AutoUpdater()
+        return self.updater
 
     def _setup_ui(self):
         """Set up the user interface."""
@@ -173,7 +137,7 @@ class UpdateDialog(QDialog):
         header_layout.addStretch()
 
         # Version info in header
-        version_label = QLabel(f"v{self.updater.current_version}")
+        version_label = QLabel("v…")
         version_label.setStyleSheet("""
             QLabel {
                 color: rgba(255, 255, 255, 0.9);
@@ -384,6 +348,9 @@ class UpdateDialog(QDialog):
             }
         """)
 
+        # Resolve updater lazily to keep dialog open responsive.
+        QTimer.singleShot(0, lambda: self._update_header_version_label(version_label))
+
         # Store references for later use
         self.check_button = self.primary_button
         self.update_button = self.secondary_button
@@ -418,6 +385,13 @@ class UpdateDialog(QDialog):
         self.update_button.clicked.connect(self._perform_update)
         self.close_button.clicked.connect(self.accept)
 
+    def _update_header_version_label(self, version_label: QLabel):
+        try:
+            updater = self._ensure_updater()
+            version_label.setText(f"v{updater.current_version}")
+        except (ImportError, OSError, RuntimeError, ValueError):
+            version_label.setText("v?")
+
     def _check_for_updates(self):
         """Check for available updates."""
         # Update UI state
@@ -432,7 +406,12 @@ class UpdateDialog(QDialog):
         self.progress_text.setText("Connecting to update server...")
 
         try:
-            update_available, latest_version, download_url, _, _ = self.updater.check_for_updates()
+            from ..core.updater import UpdaterError
+
+            updater = self._ensure_updater()
+            check = updater.check_for_updates_result()
+            update_available = check.update_available
+            latest_version = check.latest_version
 
             if update_available:
                 self._set_status_icon("update_available")
@@ -446,20 +425,14 @@ class UpdateDialog(QDialog):
                 self.status_subtitle.setText("You're running the latest version")
                 self.progress_text.setText("No updates available")
 
-        except UpdaterError as e:
+        except Exception as e:
+            # Keep updater errors user-friendly while avoiding hard import cost at module import-time.
             self._set_status_icon("error")
             self.status_title.setText("Check Failed")
             details = self._format_update_error(e)
             self.status_subtitle.setText("Unable to check for updates")
             self.progress_text.setText(details)
             logger.error(f"Update check failed: {e}")
-        except (UpdaterError, ValueError, RuntimeError) as e:
-            self._set_status_icon("error")
-            self.status_title.setText("Error")
-            details = self._format_update_error(e)
-            self.status_subtitle.setText("An unexpected error occurred")
-            self.progress_text.setText(details)
-            logger.error(f"Unexpected error during update check: {e}")
         finally:
             self.check_button.setEnabled(True)
             self.check_button.setText("🔍 Check for Updates")
@@ -467,34 +440,6 @@ class UpdateDialog(QDialog):
 
     def _perform_update(self):
         """Perform the update process."""
-        if self._requires_admin_elevation():
-            answer = PangMessageBox.question(
-                self,
-                "Administrator Rights Required",
-                (
-                    "Installing updates to Program Files requires administrator permissions.\n\n"
-                    "PangCrypter will request elevation now. Continue?"
-                ),
-            )
-            if answer != PangMessageBox.StandardButton.Yes:
-                self._set_status_icon("ready")
-                self.status_title.setText("Ready to Install")
-                self.status_subtitle.setText("Administrator permission was not granted")
-                return
-
-            elevated = run_as_admin()
-            if elevated:
-                # Elevated instance has been launched; close current one cleanly.
-                self.accept()
-                QApplication.quit()
-            else:
-                self._set_status_icon("error")
-                self.status_title.setText("Elevation Failed")
-                self.status_subtitle.setText("Could not start elevated updater")
-                self.progress_text.setVisible(True)
-                self.progress_text.setText("Please try again or run PangCrypter as administrator.")
-            return
-
         # Update UI state
         self._set_status_icon("downloading")
         self.status_title.setText("Installing Update")
@@ -509,32 +454,11 @@ class UpdateDialog(QDialog):
         self.progress_text.setText("Preparing installation...")
 
         # Start update in background thread
-        self.update_worker = UpdateWorker(self.updater)
+        updater = self._ensure_updater()
+        self.update_worker = UpdateWorker(updater)
         self.update_worker.progress_updated.connect(self._on_progress_updated)
         self.update_worker.update_completed.connect(self._on_update_completed)
         self.update_worker.start()
-
-    def _requires_admin_elevation(self) -> bool:
-        if os.name != "nt":
-            return False
-
-        install_dir = os.path.dirname(sys.executable)
-        if not install_dir:
-            return False
-
-        in_program_files = install_dir.lower().startswith(
-            os.environ.get("ProgramFiles", r"C:\Program Files").lower()
-        ) or install_dir.lower().startswith(
-            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)").lower()
-        )
-
-        needs_write = not os.access(install_dir, os.W_OK)
-        if is_running_as_admin():
-            return False
-
-        # os.access() can be unreliable with UAC/virtualization; require elevation
-        # whenever installed under Program Files OR write access is clearly missing.
-        return in_program_files or needs_write
 
     def _on_progress_updated(self, progress: int, message: str):
         """Handle progress updates from the update worker."""
@@ -556,22 +480,34 @@ class UpdateDialog(QDialog):
     def _on_update_completed(self, success: bool, message: str):
         """Handle update completion."""
         self.progress_bar.setValue(100)
+        updater = self._ensure_updater()
 
         if success:
-            report = self.updater.get_last_update_report()
+            report = updater.get_last_update_report()
             self._set_status_icon("success")
             self.status_title.setText("Update Complete!")
-            self.status_subtitle.setText("Restarting application...")
+            if report.external_apply_started:
+                self.status_subtitle.setText("Finishing update in installer helper...")
+            else:
+                self.status_subtitle.setText("Restarting application...")
             if report.publisher_verified:
                 self.progress_text.setText("Installation successful — Verified publisher signature")
             else:
                 self.progress_text.setText("Installation completed — NOT verified publisher signature")
 
-            # Show success message and restart
-            PangMessageBox.information(self, "Update Complete", message)
-
-            # Schedule restart after a short delay
-            QTimer.singleShot(2000, self._restart_application)
+            if report.external_apply_started:
+                PangMessageBox.information(
+                    self,
+                    "Update in Progress",
+                    "Update files were verified and handed off to installer helper. PangCrypter will now close and reopen when update is complete.",
+                )
+                self.accept()
+                QApplication.quit()
+            else:
+                # Show success message and restart
+                PangMessageBox.information(self, "Update Complete", message)
+                # Schedule restart after a short delay
+                QTimer.singleShot(2000, self._restart_application)
         else:
             self._set_status_icon("error")
             self.status_title.setText("Installation Failed")
@@ -591,7 +527,7 @@ class UpdateDialog(QDialog):
     def _restart_application(self):
         """Restart the application after successful update."""
         try:
-            restarted = self.updater.restart_application()
+            restarted = self._ensure_updater().restart_application()
             if restarted:
                 self.accept()
                 QApplication.quit()
@@ -603,64 +539,3 @@ class UpdateDialog(QDialog):
                 f"Update completed but failed to restart automatically.\nPlease restart PangCrypter manually.\n\nError: {e}"
             )
             self.accept()
-
-    
-
-    def _rollback_update(self):
-        # 1. Check admin first
-        self._check_admin_and_prompt()
-
-        # 2. Ask user for version
-        version_choice, ok = QInputDialog.getItem(
-            self, "Rollback Version", "Select version:", self.updater.get_available_versions(), 0, False
-        )
-        if not ok:
-            return
-
-        # 3. Update UI
-        self._set_status_icon("downloading")
-        self.status_title.setText(f"Rolling back to {version_choice}...")
-        self.status_subtitle.setText("Downloading rollback package...")
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_text.setVisible(True)
-        self.progress_text.setText("Starting rollback...")
-        self.update_button.setEnabled(False)
-        self.check_button.setEnabled(False)
-
-        # 4. Start rollback thread
-        self.rollback_worker = RollbackWorker(self.updater, version_choice)
-        self.rollback_worker.progress_updated.connect(lambda p, msg: self._update_progress_ui(p, msg))
-        self.rollback_worker.rollback_completed.connect(self._on_rollback_completed)
-        self.rollback_worker.start()
-
-    def _update_progress_ui(self, progress, message):
-        self.progress_bar.setValue(progress)
-        self.progress_text.setText(message)
-
-    def _on_rollback_completed(self, success, message):
-        self.progress_bar.setValue(100)
-        if success:
-            PangMessageBox.information(self, "Rollback Complete", message)
-            self._restart_application()
-        else:
-            PangMessageBox.warning(self, "Rollback Failed", message)
-        self.update_button.setEnabled(True)
-        self.check_button.setEnabled(True)
-
-    def _check_admin_and_prompt(self):
-        if os.name != "nt" or is_running_as_admin():
-            return
-        install_dir = os.path.dirname(sys.executable)
-        in_program_files = install_dir.lower().startswith(
-            os.environ.get("ProgramFiles", r"C:\Program Files").lower()
-        ) or install_dir.lower().startswith(
-            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)").lower()
-        )
-
-        if in_program_files or not os.access(install_dir, os.W_OK):
-            elevated = run_as_admin()
-            if elevated:
-                self.accept()
-                QApplication.quit()

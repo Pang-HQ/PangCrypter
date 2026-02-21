@@ -25,16 +25,36 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtCore import Qt, QSize
+from .mem_guard import MemGuardMode
 
 logger = logging.getLogger(__name__)
 
-MEM_GUARD_MODE_OFF = "off"
-MEM_GUARD_MODE_NORMAL = "normal"
-MEM_GUARD_MODE_ULTRA = "ultra_aggressive"
+MEM_GUARD_MODE_OFF = MemGuardMode.OFF.name.lower()
+MEM_GUARD_MODE_NORMAL = MemGuardMode.NORMAL.name.lower()
+MEM_GUARD_MODE_ULTRA = MemGuardMode.ULTRA_AGGRESSIVE.name.lower()
+
+_MEM_GUARD_MODE_NAME_TO_VALUE = {
+    mode.name: mode.name.lower()
+    for mode in MemGuardMode
+}
+
+
+def _normalize_mem_guard_mode_name(mode: str) -> str:
+    normalized = str(mode or "").strip().replace("-", "_").upper()
+    if normalized in {"ULTRA", "ULTRAAGGRESSIVE"}:
+        normalized = "ULTRA_AGGRESSIVE"
+    if not normalized:
+        normalized = MemGuardMode.OFF.name
+    return normalized
+
+
+def _mem_guard_mode_to_storage_value(mode: str) -> str:
+    name = _normalize_mem_guard_mode_name(mode)
+    return _MEM_GUARD_MODE_NAME_TO_VALUE.get(name, default_mem_guard_mode())
 
 
 def default_mem_guard_mode() -> str:
-    return MEM_GUARD_MODE_NORMAL if _is_mem_guard_supported() else MEM_GUARD_MODE_OFF
+    return MemGuardMode.NORMAL.name.lower() if _is_mem_guard_supported() else MemGuardMode.OFF.name.lower()
 
 
 def _is_mem_guard_supported() -> bool:
@@ -57,6 +77,32 @@ def _file_sha256(path: str) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def _normalize_whitelist_entry_with_hash(path: str, sha256: str) -> dict | None:
+    clean_path = os.path.abspath(str(path or "").strip())
+    if not clean_path:
+        return None
+
+    clean_sha = str(sha256 or "").strip().lower()
+    if not clean_sha:
+        if os.path.isfile(clean_path):
+            clean_sha = _file_sha256(clean_path).lower()
+        else:
+            logger.warning(
+                "Dropping mem-guard whitelist entry without hash because file is not accessible: %s",
+                clean_path,
+            )
+            return None
+
+    if not clean_sha:
+        logger.warning(
+            "Dropping mem-guard whitelist entry because SHA-256 could not be computed: %s",
+            clean_path,
+        )
+        return None
+
+    return {"path": clean_path, "sha256": clean_sha}
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _CHEVRON_DOWN = os.path.join(_PROJECT_ROOT, "ui", "chevron-down.svg").replace("\\", "/")
@@ -296,9 +342,7 @@ class Preferences:
         self.mem_guard_scan_interval_ms = max(20, min(200, int(self.mem_guard_scan_interval_ms)))
         self.mem_guard_pid_cache_cap = max(32, min(512, int(self.mem_guard_pid_cache_cap)))
 
-        valid_modes = {MEM_GUARD_MODE_OFF, MEM_GUARD_MODE_NORMAL, MEM_GUARD_MODE_ULTRA}
-        if self.mem_guard_mode not in valid_modes:
-            self.mem_guard_mode = default_mem_guard_mode()
+        self.mem_guard_mode = _mem_guard_mode_to_storage_value(self.mem_guard_mode)
 
         if not isinstance(self.mem_guard_whitelist, list):
             self.mem_guard_whitelist = []
@@ -306,16 +350,15 @@ class Preferences:
         normalized_whitelist: list[dict] = []
         for item in self.mem_guard_whitelist:
             if isinstance(item, str) and item.strip():
-                normalized_whitelist.append({"path": os.path.abspath(item), "sha256": ""})
+                normalized = _normalize_whitelist_entry_with_hash(item, "")
+                if normalized:
+                    normalized_whitelist.append(normalized)
             elif isinstance(item, dict):
                 path = str(item.get("path", "")).strip()
                 if path:
-                    normalized_whitelist.append(
-                        {
-                            "path": os.path.abspath(path),
-                            "sha256": str(item.get("sha256", "")).strip().lower(),
-                        }
-                    )
+                    normalized = _normalize_whitelist_entry_with_hash(path, str(item.get("sha256", "")))
+                    if normalized:
+                        normalized_whitelist.append(normalized)
 
         deduped: dict[str, dict] = {}
         for entry in normalized_whitelist:
@@ -732,7 +775,7 @@ class PreferencesDialog(QDialog):
         if not PangPreferences.session_cache_enabled or not _is_mem_guard_supported():
             PangPreferences.mem_guard_mode = MEM_GUARD_MODE_OFF
         else:
-            PangPreferences.mem_guard_mode = requested_mode
+            PangPreferences.mem_guard_mode = _mem_guard_mode_to_storage_value(requested_mode)
 
         whitelist_items: list[dict] = []
         for i in range(self.whitelist_list.count()):

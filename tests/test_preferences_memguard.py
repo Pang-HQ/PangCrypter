@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 from pangcrypter.main import MainWindow
+from pangcrypter.core.mem_guard_controller import MemGuardController
 from pangcrypter.utils.preferences import Preferences
 import pangcrypter.utils.mem_guard as mem_guard
 
@@ -59,21 +60,30 @@ def test_preferences_migrates_legacy_file(monkeypatch, tmp_path):
 
 
 def test_mem_guard_stop_failure_disables_until_restart(monkeypatch):
-    mw = MainWindow.__new__(MainWindow)
-    mw.mem_guard_checker = _FakeChecker()
-    mw.mem_guard_thread = _FakeThread(wait_result=False)
-    mw._mem_guard_disabled_until_restart = False
-    mw.status_bar = _FakeStatusBar()
+    host = SimpleNamespace(status_bar=_FakeStatusBar())
+    prefs = SimpleNamespace(
+        session_cache_enabled=True,
+        mem_guard_mode="normal",
+        mem_guard_whitelist=[],
+        mem_guard_scan_interval_ms=50,
+        mem_guard_pid_cache_cap=128,
+    )
+    logger = SimpleNamespace(error=lambda *a, **k: None, warning=lambda *a, **k: None)
 
-    monkeypatch.setattr("pangcrypter.main.PangPreferences", type("P", (), {"session_cache_enabled": True, "mem_guard_mode": "normal"})())
-    monkeypatch.setattr("pangcrypter.main.is_mem_guard_supported", lambda: True)
+    controller = MemGuardController(host, prefs, logger)
+    controller._module_ready = True
+    controller._api = {
+        "is_mem_guard_supported": lambda: True,
+        "MemGuardMode": mem_guard.MemGuardMode,
+        "MemGuardChecker": mem_guard.MemGuardChecker,
+        "file_sha256": lambda _p: "",
+    }
 
-    assert MainWindow._stop_mem_guard(mw) is False
-    assert MainWindow._stop_mem_guard(mw) is False
+    monkeypatch.setattr(controller, "stop", lambda: False)
 
-    MainWindow._configure_mem_guard(mw)
-    assert mw._mem_guard_disabled_until_restart is True
-    assert "disabled until restart" in (mw.status_bar.last_message or "")
+    controller.configure()
+    assert controller._disabled_until_restart is True
+    assert "disabled until restart" in (host.status_bar.last_message or "")
 
 
 def test_mem_guard_normal_write_trusted_system_is_log_only(monkeypatch):

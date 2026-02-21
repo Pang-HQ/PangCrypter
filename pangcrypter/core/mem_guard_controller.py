@@ -39,8 +39,17 @@ class MemGuardController:
             return False
         if not getattr(self.preferences, "session_cache_enabled", False):
             return False
-        mode = str(getattr(self.preferences, "mem_guard_mode", "off")).lower()
-        return mode != "off"
+        mode_name = str(getattr(self.preferences, "mem_guard_mode", "off")).strip().replace("-", "_").upper()
+        return mode_name != "OFF"
+
+    @staticmethod
+    def _parse_mode(mode_raw: str, MemGuardMode):
+        normalized = str(mode_raw or "").strip().replace("-", "_").upper()
+        if not normalized:
+            normalized = "OFF"
+        if normalized in {"ULTRA", "ULTRAAGGRESSIVE"}:
+            normalized = "ULTRA_AGGRESSIVE"
+        return MemGuardMode[normalized]
 
     def _wait_for_module_ready(self, timeout_ms: int = 6000) -> bool:
         if os.name != "nt":
@@ -168,12 +177,11 @@ class MemGuardController:
 
         MemGuardMode = self._api["MemGuardMode"]
         MemGuardChecker = self._api["MemGuardChecker"]
-        if self.preferences.mem_guard_mode == MemGuardMode.OFF.value:
-            return
-
         try:
-            mode = MemGuardMode(self.preferences.mem_guard_mode)
-        except ValueError:
+            mode = self._parse_mode(self.preferences.mem_guard_mode, MemGuardMode)
+        except (KeyError, ValueError):
+            return
+        if mode == MemGuardMode.OFF:
             return
 
         self._ensure_self_whitelist()

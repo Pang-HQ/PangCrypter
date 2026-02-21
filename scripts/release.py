@@ -286,6 +286,42 @@ def ensure_gh_cli(gh_bin: str) -> None:
         )
 
 
+def ensure_git_cli() -> None:
+    result = subprocess.run(["git", "--version"], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("Git CLI not found. Install git and ensure it is available on PATH.")
+
+
+def git_commit_tag_push(version: str, commit_message: str, push_git: bool) -> None:
+    tag = f"v{version}"
+
+    add_result = subprocess.run(["git", "add", str(VERSION_FILE), str(INIT_FILE)])
+    if add_result.returncode != 0:
+        raise RuntimeError("Failed to stage version files for commit.")
+
+    commit_result = subprocess.run(["git", "commit", "-m", commit_message], capture_output=True, text=True)
+    if commit_result.returncode != 0:
+        out = (commit_result.stdout or "") + (commit_result.stderr or "")
+        if "nothing to commit" not in out.lower():
+            raise RuntimeError(f"git commit failed: {out.strip()}")
+
+    tag_check = subprocess.run(["git", "tag", "--list", tag], capture_output=True, text=True)
+    if tag_check.returncode != 0:
+        raise RuntimeError("Failed to verify existing git tags.")
+    if tag not in tag_check.stdout.split():
+        tag_result = subprocess.run(["git", "tag", "-a", tag, "-m", f"Release {tag}"])
+        if tag_result.returncode != 0:
+            raise RuntimeError(f"Failed to create git tag {tag}.")
+
+    if push_git:
+        push_branch = subprocess.run(["git", "push"])
+        if push_branch.returncode != 0:
+            raise RuntimeError("Failed to push git branch commits.")
+        push_tag = subprocess.run(["git", "push", "origin", tag])
+        if push_tag.returncode != 0:
+            raise RuntimeError(f"Failed to push git tag {tag}.")
+
+
 def publish_release(
     gh_bin: str,
     version: str,
@@ -343,6 +379,20 @@ def main() -> int:
     parser.add_argument("--version", help="Release version (format: X.X.X). If omitted, prompts interactively.")
     parser.add_argument("--release-name", help="Release title shown in GitHub (default: version).")
     parser.add_argument("--yes", action="store_true", help="Auto-confirm publish prompt.")
+    parser.add_argument(
+        "--skip-git",
+        action="store_true",
+        help="Skip git commit/tag step for version files.",
+    )
+    parser.add_argument(
+        "--push-git",
+        action="store_true",
+        help="Push git commit and tag to remote after release commit/tag step.",
+    )
+    parser.add_argument(
+        "--git-commit-message",
+        help="Custom git commit message for version bump (default: chore(release): prepare vX.Y.Z).",
+    )
     parser.add_argument(
         "--skip-notes-edit",
         action="store_true",
@@ -421,6 +471,11 @@ def main() -> int:
 
         if not confirm_publish(auto_confirm=args.yes):
             raise RuntimeError("Publish cancelled by user.")
+
+        if not args.skip_git:
+            ensure_git_cli()
+            commit_message = args.git_commit_message or f"chore(release): prepare v{version}"
+            git_commit_tag_push(version, commit_message=commit_message, push_git=args.push_git)
 
         publish_release(
             gh_bin,

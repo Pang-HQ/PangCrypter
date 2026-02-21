@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from nacl.exceptions import CryptoError as NaClCryptoError
 
 from PyQt6.QtWidgets import QFileDialog
 
@@ -32,6 +33,11 @@ class PanicRecoveryService:
         encrypt_file = self.host.document_service.encrypt_file
         password_bytes = self.host.session_state.get_cached_password_bytes()
         usb_key = self.host.session_state.get_cached_usb_key()
+        if isinstance(password_bytes, bytes):
+            password_bytes = bytearray(password_bytes)
+        if isinstance(usb_key, bytes):
+            usb_key = bytearray(usb_key)
+        content: bytes | None = None
         self.host.reset_secret_idle_timer()
 
         try:
@@ -59,6 +65,11 @@ class PanicRecoveryService:
             )
             if not fallback_path:
                 return False
+            if content is None:
+                try:
+                    content = self.host._serialize_editor_content()
+                except (ValueError, TypeError, OSError, RuntimeError):
+                    return False
             try:
                 encrypt_file(
                     content,
@@ -86,8 +97,8 @@ class PanicRecoveryService:
         decrypt_file = self.host.document_service.decrypt_file
         create_or_load_key = self.host.document_service.create_or_load_key
 
-        password_bytes = None
-        usb_key = None
+        password_bytes: bytearray | None = None
+        usb_key: bytearray | None = None
         try:
             if self.host.current_mode in [EncryptModeType.MODE_PASSWORD_ONLY, EncryptModeType.MODE_PASSWORD_PLUS_KEY]:
                 from ..ui.main_ui import PasswordDialog
@@ -105,9 +116,14 @@ class PanicRecoveryService:
                 if not usb_dlg.exec_():
                     return False
                 selected_usb_path = usb_dlg.selected_usb
-                usb_key, _ = create_or_load_key(selected_usb_path, self.host.saved_file_path or path, create=False)
+                loaded_usb_key, _ = create_or_load_key(selected_usb_path, self.host.saved_file_path or path, create=False)
+                usb_key = bytearray(loaded_usb_key) if loaded_usb_key else None
 
-            plaintext = decrypt_file(path, password=password_bytes, usb_key=usb_key)
+            plaintext = decrypt_file(
+                path,
+                password=password_bytes,
+                usb_key=bytes(usb_key) if usb_key else None,
+            )
             content_str = plaintext.decode("utf-8")
             self.host._load_editor_content(content_str)
             self.host.best_effort_clear_memory(plaintext)
@@ -140,9 +156,8 @@ class PanicRecoveryService:
                     except OSError:
                         pass
             return True
-        except (ValueError, TypeError, OSError, RuntimeError, UnicodeDecodeError):
+        except (NaClCryptoError, ValueError, TypeError, OSError, RuntimeError, UnicodeDecodeError):
             return False
         finally:
             self.host._clear_temporary_bytes(password_bytes)
-            if isinstance(usb_key, bytearray):
-                self.host._clear_temporary_bytes(usb_key)
+            self.host._clear_temporary_bytes(usb_key)

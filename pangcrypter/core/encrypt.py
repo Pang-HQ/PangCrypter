@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 
 from uuid import UUID
+from .errors import DecryptionAuthError
 
 from .format_config import (
     HEADER_VERSION,
@@ -221,10 +222,10 @@ def decrypt_file(input_path: str,
     header = data[:uuid_end]
 
     # Decrypt using the full header (settings + salt + UUID) as Associated Data.
-    # Normalize low-level NaCl auth failures into ValueError so callers can
-    # consistently treat this as invalid credentials/corrupt input without
-    # crashing the UI path.
+    # Re-raise auth/tag failures as a dual-inheritance error so existing callers
+    # expecting CryptoError continue working while UI code catching ValueError
+    # also remains stable.
     try:
         return crypto_aead_xchacha20poly1305_ietf_decrypt(ciphertext, header, nonce, key)
     except NaClCryptoError as exc:
-        raise ValueError("Decryption failed: wrong password/key or corrupted file") from exc
+        raise DecryptionAuthError("Decryption failed: wrong password/key or corrupted file") from exc
