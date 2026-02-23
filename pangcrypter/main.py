@@ -89,7 +89,7 @@ class MainWindow(QMainWindow):
 
     def _init_ui(self):
         self.setWindowTitle("PangCrypter Editor")
-        self.setWindowIcon(QIcon("ui/logo.ico"))
+        self._set_app_window_icon()
         self.resize(800, 600)
 
         self.editor = EditorWidget(tab_setting=PangPreferences.tab_setting)
@@ -147,9 +147,49 @@ class MainWindow(QMainWindow):
         menu_bar = self.menuBar()
         if menu_bar is not None:
             menu_bar.setEnabled(True)
+        QTimer.singleShot(0, self._prewarm_document_crypto_api)
         QTimer.singleShot(0, update_dialog_loader.preload_async)
         QTimer.singleShot(self.UPDATER_PRELOAD_DELAY_MS, update_dialog_loader.preload_backend_async)
         QTimer.singleShot(self.DEFERRED_RUNTIME_SERVICES_START_MS, self.runtime_services.start_deferred_services)
+
+    def _resolve_app_icon_path(self) -> str:
+        candidates: list[str] = []
+        if getattr(sys, "frozen", False):
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            candidates.extend(
+                [
+                    os.path.join(exe_dir, "ui", "logo.ico"),
+                    os.path.join(exe_dir, "logo.ico"),
+                ]
+            )
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.extend(
+            [
+                os.path.join(here, "..", "ui", "logo.ico"),
+                os.path.join(os.getcwd(), "ui", "logo.ico"),
+            ]
+        )
+
+        for candidate in candidates:
+            resolved = os.path.abspath(candidate)
+            if os.path.isfile(resolved):
+                return resolved
+        return ""
+
+    def _set_app_window_icon(self) -> None:
+        icon_path = self._resolve_app_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
+        else:
+            logger.warning("App window icon not found; checked frozen/source candidate paths")
+
+    def _prewarm_document_crypto_api(self) -> None:
+        try:
+            # Warm lazy imports used by save/open so first action has lower latency.
+            self.document_service.get_encrypt_mode_type()
+        except (ImportError, OSError, RuntimeError, ValueError) as e:
+            logger.warning("Deferred crypto API prewarm failed: %s", e)
 
     def _build_menus(self):
         menu_bar = self.menuBar()
