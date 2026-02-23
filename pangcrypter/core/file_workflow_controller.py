@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import logging
 from dataclasses import dataclass
+from time import monotonic
 from uuid import UUID, uuid4
 from typing import Optional
 
@@ -278,12 +279,26 @@ class FileWorkflowController:
             self.host.operation_mutex.unlock()
 
     def open_file(self, path: str | None = None):
+        timing_start = monotonic()
+        last_tick = timing_start
+        stage_timings_ms: list[tuple[str, float]] = []
+
+        def _mark(stage: str) -> None:
+            nonlocal last_tick
+            now = monotonic()
+            stage_timings_ms.append((stage, (now - last_tick) * 1000.0))
+            last_tick = now
+
         mem_guard_controller = self.host._ensure_mem_guard_controller()
         if not mem_guard_controller.ensure_ready_for_sensitive_action("opening"):
+            _mark("mem_guard_gate")
             return
+        _mark("mem_guard_gate")
         if not self.host.operation_mutex.tryLock():
             PangMessageBox.warning(self.host, "Operation in Progress", "Another operation is in progress. Please wait.")
+            _mark("operation_mutex")
             return
+        _mark("operation_mutex")
 
         try:
             self.host.show_progress("Opening file...")
@@ -294,7 +309,9 @@ class FileWorkflowController:
             if not path:
                 path, _ = QFileDialog.getOpenFileName(self.host, "Open encrypted file", filter="Encrypted Files (*.enc)")
                 if not path:
+                    _mark("file_dialog")
                     return
+            _mark("file_dialog")
 
             self.validate_file_path(path)
             if not os.path.exists(path):
@@ -306,6 +323,7 @@ class FileWorkflowController:
 
             self.host.update_progress(10)
             header = self._read_header(path, EncryptModeType)
+            _mark("header_read")
             file_uuid = header.file_uuid
             mode = header.mode
             self.host.header_version = header.version
@@ -321,15 +339,20 @@ class FileWorkflowController:
             if mode_uses_password(mode, EncryptModeType):
                 password_bytes = self._prompt_password(validate_strength=False, confirm=False)
                 if password_bytes is None:
+                    _mark("password_prompt")
                     return
+                _mark("password_prompt")
 
             self.host.update_progress(40)
 
             if mode_uses_usb(mode, EncryptModeType):
                 selected_usb_path = self._select_usb_path()
                 if selected_usb_path is None:
+                    _mark("usb_select")
                     return
+                _mark("usb_select")
                 random_key, loaded_uuid = create_or_load_key(selected_usb_path, path, create=False)
+                _mark("usb_key_load")
                 if loaded_uuid is not None:
                     file_uuid = loaded_uuid
 
@@ -338,10 +361,13 @@ class FileWorkflowController:
 
             self.host.update_progress(60)
             plaintext = decrypt_file(path, password=password_bytes, usb_key=random_key)
+            _mark("decrypt")
 
             self.host.update_progress(80)
             content_str = plaintext.decode("utf-8")
+            _mark("utf8_decode")
             self.host._load_editor_content(content_str)
+            _mark("editor_load")
             self.host.best_effort_clear_memory(plaintext)
 
             self.host.update_progress(100)
@@ -358,6 +384,7 @@ class FileWorkflowController:
             self.host.status_bar.showMessage("File opened successfully", 3000)
             PangMessageBox.information(self.host, "Success", "File opened successfully.")
             self.host.update_file_info_label()
+            _mark("ui_finalize")
 
         except ValidationError as e:
             PangMessageBox.critical(self.host, "Validation Error", str(e))
@@ -368,5 +395,11 @@ class FileWorkflowController:
         except (NaClCryptoError, OSError, RuntimeError, ValueError, TypeError, UnicodeDecodeError) as e:
             PangMessageBox.critical(self.host, "Open Failed", f"An unexpected error occurred:\n{e}")
         finally:
+            total_ms = (monotonic() - timing_start) * 1000.0
+            if stage_timings_ms:
+                breakdown = ", ".join(f"{name}={ms:.1f}ms" for name, ms in stage_timings_ms)
+                logger.info("Open file timing: total=%.1fms | %s", total_ms, breakdown)
+            else:
+                logger.info("Open file timing: total=%.1fms", total_ms)
             self.host.hide_progress()
             self.host.operation_mutex.unlock()

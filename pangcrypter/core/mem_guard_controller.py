@@ -74,10 +74,18 @@ class MemGuardController:
 
         self.start()
 
-        if not self._wait_for_module_ready():
+        # IMPORTANT: keep this path non-blocking to avoid UI freezes when users
+        # trigger file operations from the main thread.
+        if self._load_error:
             self.host.status_bar.showMessage(
                 f"Security module failed to load — cannot continue {action_name}.",
                 4000,
+            )
+            return False
+        if not self._module_ready:
+            self.host.status_bar.showMessage(
+                f"Security module still initializing — please retry {action_name} in a moment.",
+                3000,
             )
             return False
 
