@@ -25,9 +25,7 @@ from typing import Callable
 
 LOG_PATH = Path(tempfile.gettempdir()) / "pang_apply_update.log"
 
-TH32CS_SNAPPROCESS = 0x00000002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-PROCESS_TERMINATE = 0x0001
 
 
 def _log(message: str) -> None:
@@ -88,7 +86,7 @@ def _relaunch_self_as_admin() -> bool:
         return False
 
 
-def _wait_for_pid_exit(pid: int, timeout_seconds: int = 120) -> None:
+def _wait_for_pid_exit(pid: int, timeout_seconds: int = 1) -> None:
     if pid <= 0:
         return
 
@@ -136,7 +134,7 @@ def _is_process_running_windows(image_name: str) -> bool:
         return False
 
 
-def _wait_for_image_exit_windows(image_name: str, timeout_seconds: int = 180) -> None:
+def _wait_for_image_exit_windows(image_name: str, timeout_seconds: int = 1) -> None:
     if os.name != "nt":
         return
     deadline = time.time() + timeout_seconds
@@ -147,92 +145,25 @@ def _wait_for_image_exit_windows(image_name: str, timeout_seconds: int = 180) ->
     raise RuntimeError(f"Timed out waiting for process to exit: {image_name}")
 
 
-class _PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [
-        ("dwSize", ctypes.c_uint32),
-        ("cntUsage", ctypes.c_uint32),
-        ("th32ProcessID", ctypes.c_uint32),
-        ("th32DefaultHeapID", ctypes.c_size_t),
-        ("th32ModuleID", ctypes.c_uint32),
-        ("cntThreads", ctypes.c_uint32),
-        ("th32ParentProcessID", ctypes.c_uint32),
-        ("pcPriClassBase", ctypes.c_long),
-        ("dwFlags", ctypes.c_uint32),
-        ("szExeFile", ctypes.c_wchar * 260),
-    ]
-
-
-def _query_process_image_path_windows(pid: int) -> str:
-    if os.name != "nt" or pid <= 0:
-        return ""
-    k32 = ctypes.windll.kernel32
-    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
-        return ""
+def _terminate_process_image_windows(image_name: str) -> None:
+    if os.name != "nt":
+        return
     try:
-        buf_len = ctypes.c_uint32(32768)
-        buf = ctypes.create_unicode_buffer(buf_len.value)
-        if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(buf_len)):
-            return buf.value
-        return ""
-    finally:
-        k32.CloseHandle(handle)
+        result = subprocess.run(
+            ["taskkill", "/F", "/T", "/IM", image_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        out = (result.stdout or "") + (result.stderr or "")
+        _log(f"taskkill {image_name}: rc={result.returncode} output={out.strip()}")
+    except (OSError, subprocess.SubprocessError) as e:
+        _log(f"taskkill failed for {image_name}: {e}")
 
 
-def _find_processes_in_install_dir_windows(install_dir: Path) -> list[tuple[int, str, str]]:
+def _wait_for_install_dir_unlock_windows(install_dir: Path, timeout_seconds: int = 1) -> bool:
     if os.name != "nt":
-        return []
-
-    install_prefix = str(install_dir.resolve()).lower().rstrip("\\/") + "\\"
-    snapshot = ctypes.windll.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snapshot == ctypes.c_void_p(-1).value:
-        return []
-
-    matches: list[tuple[int, str, str]] = []
-    try:
-        entry = _PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
-        has_item = bool(ctypes.windll.kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
-        while has_item:
-            pid = int(entry.th32ProcessID)
-            if pid and pid != os.getpid():
-                image_path = _query_process_image_path_windows(pid)
-                if image_path:
-                    lowered = image_path.lower()
-                    if lowered.startswith(install_prefix):
-                        matches.append((pid, entry.szExeFile, image_path))
-            has_item = bool(ctypes.windll.kernel32.Process32NextW(snapshot, ctypes.byref(entry)))
-    finally:
-        ctypes.windll.kernel32.CloseHandle(snapshot)
-
-    return matches
-
-
-def _terminate_processes_in_install_dir_windows(install_dir: Path) -> None:
-    if os.name != "nt":
-        return
-
-    k32 = ctypes.windll.kernel32
-    targets = _find_processes_in_install_dir_windows(install_dir)
-    if not targets:
-        return
-
-    for pid, exe_name, image_path in targets:
-        try:
-            _log(f"Terminating lingering process pid={pid} exe={exe_name} path={image_path}")
-            handle = k32.OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if handle:
-                try:
-                    k32.TerminateProcess(handle, 0)
-                finally:
-                    k32.CloseHandle(handle)
-        except OSError:
-            continue
-
-
-def _wait_for_install_dir_unlock_windows(install_dir: Path, timeout_seconds: int = 120) -> None:
-    if os.name != "nt":
-        return
+        return True
 
     deadline = time.time() + timeout_seconds
     last_error: OSError | None = None
@@ -244,12 +175,13 @@ def _wait_for_install_dir_unlock_windows(install_dir: Path, timeout_seconds: int
                 shutil.rmtree(probe_target, ignore_errors=True)
             os.replace(str(install_dir), str(probe_target))
             os.replace(str(probe_target), str(install_dir))
-            return
+            return True
         except OSError as e:
             last_error = e
             time.sleep(0.25)
 
-    raise RuntimeError(f"Install directory remained locked: {last_error}")
+    _log(f"Install directory still locked after wait: {last_error}")
+    return False
 
 
 def _sha256_file(path: Path) -> str:
@@ -281,14 +213,13 @@ def _validate_manifest(staging_dir: Path, manifest_name: str) -> None:
 
 def _retry(action: Callable[[], None], retries: int, base_sleep_ms: int) -> None:
     last_error: Exception | None = None
-    for attempt in range(retries):
+    attempts = 1
+    for attempt in range(attempts):
         try:
             action()
             return
         except OSError as e:
             last_error = e
-            sleep_ms = min(base_sleep_ms + attempt * 50, 750)
-            time.sleep(sleep_ms / 1000.0)
     if last_error:
         raise last_error
 
@@ -343,10 +274,8 @@ def _swap_install_dirs(
     try:
         _retry(_rename_install_to_backup, retries=retries, base_sleep_ms=base_sleep_ms)
     except OSError as initial_swap_error:
-        # Best effort: terminate any remaining processes that still run from install_dir,
-        # wait for lock release, then try again.
+        # Best effort: wait for lock release, then try again.
         _log(f"Initial install->backup rename failed: {initial_swap_error}")
-        _terminate_processes_in_install_dir_windows(install_dir)
         _wait_for_install_dir_unlock_windows(install_dir, timeout_seconds=120)
         _retry(_rename_install_to_backup, retries=retries, base_sleep_ms=base_sleep_ms)
 
@@ -362,6 +291,74 @@ def _swap_install_dirs(
             except OSError:
                 pass
         raise RuntimeError(f"Failed to activate incoming installation: {swap_error}") from swap_error
+
+
+def _apply_incoming_in_place(
+    install_dir: Path,
+    incoming_dir: Path,
+    backup_dir: Path,
+    retries: int,
+    base_sleep_ms: int,
+) -> None:
+    """Apply incoming payload by file replacement instead of directory swap.
+
+    This avoids whole-directory rename failures when external processes keep a
+    handle open on the install directory path.
+    """
+    if not install_dir.exists():
+        raise RuntimeError(f"Install directory does not exist: {install_dir}")
+    if not incoming_dir.exists():
+        raise RuntimeError(f"Incoming directory does not exist: {incoming_dir}")
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    replaced_files: list[tuple[Path, Path]] = []
+
+    def _replace_file(src: Path, dst: Path) -> None:
+        tmp_dst = dst.with_name(dst.name + ".tmp")
+
+        def _op() -> None:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, tmp_dst)
+            os.replace(str(tmp_dst), str(dst))
+
+        try:
+            _retry(_op, retries=retries, base_sleep_ms=base_sleep_ms)
+        finally:
+            try:
+                if tmp_dst.exists():
+                    tmp_dst.unlink()
+            except OSError:
+                pass
+
+    try:
+        for root, _dirs, files in os.walk(incoming_dir):
+            root_path = Path(root)
+            rel_dir = root_path.relative_to(incoming_dir)
+            dest_root = install_dir / rel_dir
+
+            for file_name in files:
+                src = root_path / file_name
+                dst = dest_root / file_name
+
+                if dst.exists():
+                    backup_target = backup_dir / rel_dir / file_name
+                    backup_target.parent.mkdir(parents=True, exist_ok=True)
+
+                    def _backup_copy() -> None:
+                        shutil.copy2(dst, backup_target)
+
+                    _retry(_backup_copy, retries=retries, base_sleep_ms=base_sleep_ms)
+                    replaced_files.append((backup_target, dst))
+
+                _replace_file(src, dst)
+    except OSError as apply_error:
+        _log(f"In-place apply failed, attempting rollback: {apply_error}")
+        for backup_src, dst in reversed(replaced_files):
+            try:
+                _replace_file(backup_src, dst)
+            except OSError as rollback_error:
+                _log(f"Rollback failed for {dst}: {rollback_error}")
+        raise RuntimeError(f"Failed to apply incoming payload in-place: {apply_error}") from apply_error
 
 
 def _cleanup_old_backups(install_dir: Path, keep: int) -> None:
@@ -404,7 +401,7 @@ def main() -> int:
     parser.add_argument("--relaunch-exe", required=True)
     parser.add_argument("--relaunch-arg", action="append", default=[])
     parser.add_argument("--manifest-name", default=".pang_update_manifest.json")
-    parser.add_argument("--max-retries", type=int, default=60)
+    parser.add_argument("--max-retries", type=int, default=1)
     parser.add_argument("--retry-base-ms", type=int, default=150)
     parser.add_argument("--keep-backups", type=int, default=3)
     parser.add_argument("--session-root", default="")
@@ -426,18 +423,21 @@ def main() -> int:
             raise RuntimeError("Could not elevate update helper")
 
         # Wait for original process to exit first.
-        _wait_for_pid_exit(args.parent_pid)
+        _wait_for_pid_exit(args.parent_pid, timeout_seconds=1)
         _log(f"Parent process exited or unavailable: pid={args.parent_pid}")
 
         # Extra safety: ensure PangCrypter binary is no longer running before swap.
         if os.name == "nt":
             image_name = relaunch_exe.name or "PangCrypter.exe"
             _log(f"Waiting for process image to stop: {image_name}")
-            _wait_for_image_exit_windows(image_name, timeout_seconds=180)
+            _wait_for_image_exit_windows(image_name, timeout_seconds=1)
             _log(f"Process image is no longer running: {image_name}")
-            _terminate_processes_in_install_dir_windows(install_dir)
-            _wait_for_install_dir_unlock_windows(install_dir, timeout_seconds=120)
-            _log("Install directory lock probe passed.")
+            _terminate_process_image_windows(image_name)
+            _wait_for_image_exit_windows(image_name, timeout_seconds=1)
+            if _wait_for_install_dir_unlock_windows(install_dir, timeout_seconds=1):
+                _log("Install directory lock probe passed.")
+            else:
+                _log("Install directory lock probe did not pass yet; continuing to swap with retries.")
 
         _validate_manifest(staging_dir, args.manifest_name)
         _log("Manifest validated.")
@@ -451,14 +451,14 @@ def main() -> int:
             retries=args.max_retries,
             base_sleep_ms=args.retry_base_ms,
         )
-        _swap_install_dirs(
+        _apply_incoming_in_place(
             install_dir=install_dir,
             incoming_dir=incoming_dir,
             backup_dir=backup_dir,
             retries=args.max_retries,
             base_sleep_ms=args.retry_base_ms,
         )
-        _log(f"Install directories swapped. backup={backup_dir} active={install_dir}")
+        _log(f"Install payload applied in-place. backup={backup_dir} active={install_dir}")
 
         _cleanup_path(args.session_root)
         _cleanup_path(str(staging_dir))

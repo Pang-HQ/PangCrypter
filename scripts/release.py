@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,97 @@ ZIP_NAME = "PangCrypter.zip"
 CHECKSUM_SUFFIX = ".sha256"
 MINISIG_SUFFIX = ".minisig"
 RELEASE_NOTES_NAME = "release-notes.md"
+
+
+def build_update_helper_only() -> Path:
+    """Build only the external update helper (PangApplyUpdate.exe)."""
+    print("\n▶ Building update helper only...")
+    try:
+        import PyInstaller.__main__  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise RuntimeError("PyInstaller is required to build update helper") from e
+
+    helper_entry = ROOT / "pangcrypter" / "tools" / "apply_update_main.py"
+    icon_path = ROOT / "ui" / "logo.ico"
+    helper_name = "PangApplyUpdate.exe" if os.name == "nt" else "PangApplyUpdate"
+
+    args = [
+        str(helper_entry),
+        "--name",
+        "PangApplyUpdate",
+        "--onefile",
+        "--windowed",
+        "--noconfirm",
+    ]
+    if os.name == "nt":
+        args.append("--uac-admin")
+    if icon_path.exists():
+        args.extend(["--icon", str(icon_path)])
+
+    PyInstaller.__main__.run(args)
+
+    helper_path = DIST_DIR / helper_name
+    if not helper_path.exists():
+        raise RuntimeError(f"Update helper build did not produce expected binary: {helper_path}")
+    return helper_path
+
+
+def replace_helper_in_release_zip(zip_path: Path, helper_binary: Path) -> None:
+    """Replace PangApplyUpdate binary inside PangCrypter.zip without full rebuild."""
+    if not zip_path.exists():
+        raise RuntimeError(f"Release ZIP not found: {zip_path}")
+    if not helper_binary.exists():
+        raise RuntimeError(f"Helper binary not found: {helper_binary}")
+
+    helper_name = helper_binary.name
+    target_entry = f"PangCrypter/{helper_name}"
+    temp_zip = zip_path.with_suffix(zip_path.suffix + ".tmp")
+
+    replaced = False
+    with zipfile.ZipFile(zip_path, "r") as zin, zipfile.ZipFile(temp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename == target_entry:
+                replaced = True
+                continue
+            data = zin.read(item.filename)
+            zout.writestr(item, data)
+
+        # Add/replace helper binary in bundle root inside zip
+        zout.write(helper_binary, arcname=target_entry)
+
+    temp_zip.replace(zip_path)
+    action = "Replaced" if replaced else "Added"
+    print(f"{action} helper in ZIP entry: {target_entry}")
+
+
+def refresh_release_helper_artifacts(
+    minisign_secret_key: Path,
+    minisign_bin: str,
+    minisign_password: Optional[str] = None,
+    minisign_public_key: Optional[Path] = None,
+) -> tuple[Path, Path, Path, str]:
+    """Rebuild helper only, patch existing ZIP, and regenerate checksum/signature."""
+    zip_path = DIST_DIR / ZIP_NAME
+    helper_bin = build_update_helper_only()
+    replace_helper_in_release_zip(zip_path, helper_bin)
+
+    checksum_path = write_checksum(zip_path)
+    checksum_value = sha256_file(zip_path)
+
+    minisig_path = sign_with_minisign(
+        zip_path,
+        minisign_secret_key,
+        minisign_bin=minisign_bin,
+        minisign_password=minisign_password,
+    )
+    verify_minisign_signature(
+        zip_path,
+        minisig_path,
+        minisign_bin=minisign_bin,
+        minisign_public_key=minisign_public_key,
+    )
+
+    return zip_path, checksum_path, minisig_path, checksum_value
 
 
 @dataclass
@@ -466,10 +558,48 @@ def main() -> int:
         "--target",
         help="Optional commit/branch target for gh release tag creation (passed to gh release create --target).",
     )
+    parser.add_argument(
+        "--refresh-helper-artifacts",
+        action="store_true",
+        help=(
+            "Build ONLY PangApplyUpdate helper, replace it in dist/PangCrypter.zip, and regenerate "
+            "PangCrypter.zip.sha256 + PangCrypter.zip.minisig for current version artifacts."
+        ),
+    )
     args = parser.parse_args()
 
     backup = backup_version_files()
     try:
+        if args.refresh_helper_artifacts:
+            current_version = parse_current_version()
+            minisign_bin = resolve_binary("minisign", env_override_key="PANGCRYPTER_MINISIGN_PATH")
+            minisign_key = args.minisign_key or os.getenv("PANGCRYPTER_MINISIGN_SECRET_KEY")
+            if not minisign_key:
+                raise RuntimeError(
+                    "Missing minisign secret key. Pass --minisign-key or set PANGCRYPTER_MINISIGN_SECRET_KEY."
+                )
+            minisign_password = args.minisign_password
+            if minisign_password is None:
+                minisign_password = os.getenv("PANGCRYPTER_MINISIGN_PASSWORD")
+            if minisign_password is None:
+                minisign_password = getpass.getpass("minisign key password (leave blank for unencrypted key): ")
+
+            minisign_pubkey = Path(args.minisign_pubkey) if args.minisign_pubkey else (ROOT / "minisign.pub")
+            zip_path, checksum_path, minisig_path, checksum_value = refresh_release_helper_artifacts(
+                minisign_secret_key=Path(minisign_key),
+                minisign_bin=minisign_bin,
+                minisign_password=minisign_password,
+                minisign_public_key=minisign_pubkey,
+            )
+
+            print("\n✅ Refreshed current release artifacts with rebuilt update helper.")
+            print(f"   Version: v{current_version}")
+            print(f"   ZIP: {zip_path}")
+            print(f"   SHA256: {checksum_path}")
+            print(f"   minisig: {minisig_path}")
+            print(f"   checksum: {checksum_value}")
+            return 0
+
         current_version = parse_current_version()
         version = validate_version_or_raise(args.version) if args.version else prompt_version(current_version)
         release_name = args.release_name or version
