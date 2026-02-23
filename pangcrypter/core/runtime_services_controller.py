@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QThread
 
+from ..preferences.proxy import PangPreferences
+
 
 class RuntimeServicesController:
     def __init__(self, host):
@@ -16,7 +18,9 @@ class RuntimeServicesController:
         if self.host.screen_recorder_thread is None:
             from ..utils.screen_recording import ScreenRecordingChecker
             self.host.screen_recorder_thread = QThread()
-            self.host.screen_recorder_checker = ScreenRecordingChecker()
+            self.host.screen_recorder_checker = ScreenRecordingChecker(
+                allowlist=set(getattr(PangPreferences, "screen_recording_allowlist", []) or [])
+            )
             self.host.screen_recorder_checker.moveToThread(self.host.screen_recorder_thread)
             self.host.screen_recorder_thread.started.connect(self.host.screen_recorder_checker.run)
             self.host.screen_recorder_checker.screen_recording_changed.connect(self.host.privacy_guard.on_screen_recording_changed)

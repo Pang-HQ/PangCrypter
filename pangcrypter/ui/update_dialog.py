@@ -10,9 +10,11 @@ from PyQt6.QtWidgets import (
     QProgressBar, QWidget, QApplication
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QIcon, QPixmap
 
 from ..utils.styles import TEXT_COLOR, DARKER_BG, PURPLE, DARK_BG
 from .messagebox import PangMessageBox
+from ..updater.service import AutoUpdater, UpdaterError
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +29,6 @@ class UpdateWorker(QThread):
 
     def run(self):
         try:
-            from ..core.updater import UpdaterError
-
             def cb(p, msg):
                 self.progress_updated.emit(p, msg)
 
@@ -41,6 +41,21 @@ class UpdateWorker(QThread):
         except (UpdaterError, OSError, ValueError, RuntimeError) as e:
             self.update_completed.emit(False, str(e))
 
+
+class UpdateCheckWorker(QThread):
+    check_completed = pyqtSignal(bool, str, str)
+
+    def __init__(self, updater):
+        super().__init__()
+        self.updater = updater
+
+    def run(self):
+        try:
+            check = self.updater.check_for_updates_result()
+            self.check_completed.emit(bool(check.update_available), str(check.latest_version or ""), "")
+        except (OSError, ValueError, RuntimeError) as e:
+            self.check_completed.emit(False, "", str(e))
+
 class UpdateDialog(QDialog):
     """Dialog for checking and performing updates."""
 
@@ -52,9 +67,37 @@ class UpdateDialog(QDialog):
 
         self.updater = None
         self.update_worker = None
+        self.check_worker = None
 
         self._setup_ui()
         self._setup_connections()
+
+    def _resolve_logo_path(self) -> str:
+        """Resolve app logo path for source and frozen builds."""
+        candidates = []
+
+        if getattr(sys, "frozen", False):
+            exe_dir = os.path.dirname(sys.executable)
+            candidates.extend(
+                [
+                    os.path.join(exe_dir, "ui", "logo.ico"),
+                    os.path.join(exe_dir, "logo.ico"),
+                ]
+            )
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.extend(
+            [
+                os.path.join(here, "..", "..", "ui", "logo.ico"),
+                os.path.join(os.getcwd(), "ui", "logo.ico"),
+            ]
+        )
+
+        for candidate in candidates:
+            resolved = os.path.abspath(candidate)
+            if os.path.isfile(resolved):
+                return resolved
+        return ""
 
     def _format_update_error(self, error: Exception) -> str:
         text = str(error).strip() or error.__class__.__name__
@@ -72,7 +115,6 @@ class UpdateDialog(QDialog):
     def _ensure_updater(self):
         if self.updater is not None:
             return self.updater
-        from ..core.updater import AutoUpdater
         self.updater = AutoUpdater()
         return self.updater
 
@@ -101,8 +143,30 @@ class UpdateDialog(QDialog):
         # App icon (you can replace with actual icon)
         icon_label = QLabel()
         icon_label.setFixedSize(32, 32)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo_path = self._resolve_logo_path()
+        if logo_path:
+            pixmap = QPixmap(logo_path)
+            if not pixmap.isNull():
+                icon_label.setPixmap(
+                    pixmap.scaled(
+                        28,
+                        28,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                self.setWindowIcon(QIcon(logo_path))
+            else:
+                icon_label.setText("P")
+        else:
+            icon_label.setText("P")
+
         icon_label.setStyleSheet("""
             QLabel {
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
                 background-color: rgba(255, 255, 255, 0.2);
                 border-radius: 6px;
             }
@@ -261,7 +325,7 @@ class UpdateDialog(QDialog):
         buttons_layout.setSpacing(10)
 
         # Primary action button
-        self.primary_button = QPushButton("🔍 Check for Updates")
+        self.primary_button = QPushButton("Check for Updates")
         self.primary_button.setFixedHeight(36)
         self.primary_button.setStyleSheet(f"""
             QPushButton {{
@@ -286,7 +350,7 @@ class UpdateDialog(QDialog):
         """)
 
         # Secondary action button (hidden initially)
-        self.secondary_button = QPushButton("⬇️ Install Update")
+        self.secondary_button = QPushButton("Install Update")
         self.secondary_button.setFixedHeight(36)
         self.secondary_button.setVisible(False)
         self.secondary_button.setStyleSheet("""
@@ -312,7 +376,7 @@ class UpdateDialog(QDialog):
         """)
 
         # Close button
-        self.close_button = QPushButton("✕ Close")
+        self.close_button = QPushButton("Close")
         self.close_button.setFixedHeight(36)
         self.close_button.setStyleSheet(f"""
             QPushButton {{
@@ -339,7 +403,7 @@ class UpdateDialog(QDialog):
         main_layout.addWidget(content_widget)
 
         # Set dialog properties
-        self.setFixedSize(560, 380)
+        self.setMinimumSize(560, 380)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
         self.setStyleSheet("""
             QDialog {
@@ -358,25 +422,25 @@ class UpdateDialog(QDialog):
     def _set_status_icon(self, status: str):
         """Set the status icon based on current state."""
         if status == "ready":
-            self.status_icon.setText("⚪")
+            self.status_icon.setText("●")
             self.status_icon.setStyleSheet("QLabel { color: #6b7280; font-size: 16px; }")
         elif status == "checking":
-            self.status_icon.setText("🔄")
+            self.status_icon.setText("●")
             self.status_icon.setStyleSheet("QLabel { color: #3b82f6; font-size: 16px; }")
         elif status == "success":
-            self.status_icon.setText("✅")
+            self.status_icon.setText("●")
             self.status_icon.setStyleSheet("QLabel { color: #10b981; font-size: 16px; }")
         elif status == "update_available":
-            self.status_icon.setText("⬆️")
+            self.status_icon.setText("●")
             self.status_icon.setStyleSheet("QLabel { color: #f59e0b; font-size: 16px; }")
         elif status == "downloading":
-            self.status_icon.setText("⬇️")
+            self.status_icon.setText("●")
             self.status_icon.setStyleSheet("QLabel { color: #8b5cf6; font-size: 16px; }")
         elif status == "error":
-            self.status_icon.setText("❌")
+            self.status_icon.setText("●")
             self.status_icon.setStyleSheet("QLabel { color: #ef4444; font-size: 16px; }")
         elif status == "up_to_date":
-            self.status_icon.setText("✨")
+            self.status_icon.setText("●")
             self.status_icon.setStyleSheet("QLabel { color: #10b981; font-size: 16px; }")
 
     def _setup_connections(self):
@@ -394,49 +458,49 @@ class UpdateDialog(QDialog):
 
     def _check_for_updates(self):
         """Check for available updates."""
+        if self.check_worker is not None and self.check_worker.isRunning():
+            return
+
         # Update UI state
         self._set_status_icon("checking")
         self.status_title.setText("Checking for Updates")
         self.status_subtitle.setText("Contacting update server...")
         self.check_button.setEnabled(False)
-        self.check_button.setText("🔄 Checking...")
+        self.check_button.setText("Checking...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # Indeterminate progress
         self.progress_text.setVisible(True)
         self.progress_text.setText("Connecting to update server...")
 
-        try:
-            from ..core.updater import UpdaterError
+        updater = self._ensure_updater()
+        self.check_worker = UpdateCheckWorker(updater)
+        self.check_worker.check_completed.connect(self._on_check_completed)
+        self.check_worker.finished.connect(lambda: setattr(self, "check_worker", None))
+        self.check_worker.start()
 
-            updater = self._ensure_updater()
-            check = updater.check_for_updates_result()
-            update_available = check.update_available
-            latest_version = check.latest_version
-
-            if update_available:
-                self._set_status_icon("update_available")
-                self.status_title.setText("Update Available!")
-                self.status_subtitle.setText(f"Version {latest_version} is ready to install (publisher signature required)")
-                self.secondary_button.setVisible(True)
-                self.progress_text.setText(f"New version {latest_version} available")
-            else:
-                self._set_status_icon("up_to_date")
-                self.status_title.setText("Up to Date")
-                self.status_subtitle.setText("You're running the latest version")
-                self.progress_text.setText("No updates available")
-
-        except Exception as e:
-            # Keep updater errors user-friendly while avoiding hard import cost at module import-time.
+    def _on_check_completed(self, update_available: bool, latest_version: str, error_message: str):
+        if error_message:
             self._set_status_icon("error")
             self.status_title.setText("Check Failed")
-            details = self._format_update_error(e)
+            details = self._format_update_error(Exception(error_message))
             self.status_subtitle.setText("Unable to check for updates")
             self.progress_text.setText(details)
-            logger.error(f"Update check failed: {e}")
-        finally:
-            self.check_button.setEnabled(True)
-            self.check_button.setText("🔍 Check for Updates")
-            self.progress_bar.setVisible(False)
+            logger.error("Update check failed: %s", error_message)
+        elif update_available:
+            self._set_status_icon("update_available")
+            self.status_title.setText("Update Available!")
+            self.status_subtitle.setText(f"Version {latest_version} is ready to install (publisher signature required)")
+            self.secondary_button.setVisible(True)
+            self.progress_text.setText(f"New version {latest_version} available")
+        else:
+            self._set_status_icon("up_to_date")
+            self.status_title.setText("Up to Date")
+            self.status_subtitle.setText("You're running the latest version")
+            self.progress_text.setText("No updates available")
+
+        self.check_button.setEnabled(True)
+        self.check_button.setText("Check for Updates")
+        self.progress_bar.setVisible(False)
 
     def _perform_update(self):
         """Perform the update process."""
@@ -446,7 +510,7 @@ class UpdateDialog(QDialog):
         self.status_subtitle.setText("Downloading and installing new version...")
         self.update_button.setEnabled(False)
         self.check_button.setEnabled(False)
-        self.update_button.setText("⏳ Installing...")
+        self.update_button.setText("Installing...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -522,7 +586,7 @@ class UpdateDialog(QDialog):
             # Re-enable buttons
             self.update_button.setEnabled(True)
             self.check_button.setEnabled(True)
-            self.update_button.setText("⬇️ Install Update")
+            self.update_button.setText("Install Update")
 
     def _restart_application(self):
         """Restart the application after successful update."""

@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+import requests  # type: ignore[import-untyped]
 from packaging import version
 from ..utils.system_binaries import resolve_trusted_binary
 
@@ -137,14 +137,24 @@ class AutoUpdater:
 
         Environment/file override is intentionally opt-in for development only.
         """
-        if os.getenv("PANGCRYPTER_ALLOW_MINISIGN_PUBKEY_OVERRIDE") == "1":
+        allow_override = os.getenv("PANGCRYPTER_ALLOW_MINISIGN_PUBKEY_OVERRIDE") == "1"
+        dev_ack = os.getenv("PANGCRYPTER_UNSAFE_DEV_MODE") == "1"
+
+        if allow_override and dev_ack:
             env_key = os.getenv("PANGCRYPTER_MINISIGN_PUBKEY", "").strip()
             if env_key:
+                logger.warning("Using OVERRIDDEN minisign public key (unsafe dev mode).")
                 return env_key
 
             pubkey_file = self._project_root() / "minisign.pub"
             if pubkey_file.exists():
+                logger.warning("Using minisign.pub override file (unsafe dev mode).")
                 return pubkey_file.read_text(encoding="utf-8").strip()
+
+        if allow_override and not dev_ack:
+            logger.warning(
+                "Ignoring minisign public key override because PANGCRYPTER_UNSAFE_DEV_MODE is not enabled."
+            )
 
         return self.TRUSTED_MINISIGN_PUBKEY
 
@@ -204,7 +214,7 @@ class AutoUpdater:
                     return ".".join(map(str, parts))
         except (OSError, ValueError, IndexError) as e:
             logger.warning(f"Could not read version.txt: {e}")
-            return "0.0.0"
+        return "0.0.0"
 
     # --------------------------
     # Update check

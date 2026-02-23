@@ -54,11 +54,15 @@ class FileWorkflowController:
         if len(password) < 8:
             raise ValidationError("Password must be at least 8 characters long")
 
+        # Strong passphrases are allowed even without mixed character classes.
+        if len(password) >= 16:
+            return True
+
         has_upper = any(c.isupper() for c in password)
         has_lower = any(c.islower() for c in password)
         has_digit = any(c.isdigit() for c in password)
         if not (has_upper and has_lower and has_digit):
-            logger.warning("Password does not meet complexity requirements")
+            logger.warning("Password does not meet complexity requirements (or use a 16+ char passphrase)")
             return False
         return True
 
@@ -66,19 +70,21 @@ class FileWorkflowController:
         ret = PangMessageBox.question(
             self.host,
             "Weak Password",
-            "The password does not meet complexity requirements. Continue anyway?",
+            "Use either a 16+ character passphrase or include upper/lowercase letters and a digit. Continue anyway?",
             buttons=PangMessageBox.StandardButton.Yes | PangMessageBox.StandardButton.No,
-            default=PangMessageBox.StandardButton.No,
+            defaultButton=PangMessageBox.StandardButton.No,
         )
         return ret == PangMessageBox.StandardButton.Yes
 
-    def _prompt_password(self, validate_strength: bool) -> Optional[bytearray]:
-        from ..ui.main_ui import PasswordDialog
+    def _prompt_password(self, validate_strength: bool, confirm: bool = False) -> Optional[bytearray]:
+        from ..ui.dialogs import PasswordDialog
 
-        pwd_dlg = PasswordDialog(self.host, warning=False)
+        pwd_dlg = PasswordDialog(self.host, warning=False, confirm=confirm)
         if not pwd_dlg.exec_():
             return None
         password_text = pwd_dlg.password
+        if password_text is None:
+            return None
 
         if validate_strength:
             try:
@@ -94,7 +100,7 @@ class FileWorkflowController:
         return password_bytes
 
     def _select_usb_path(self) -> Optional[str]:
-        from ..ui.main_ui import USBSelectDialog
+        from ..ui.dialogs import USBSelectDialog
 
         usbs = self.host.check_usb_present()
         if not usbs:
@@ -123,7 +129,6 @@ class FileWorkflowController:
             encrypt_file = self.host.document_service.encrypt_file
             password_bytes = self.host.session_state.get_cached_password_bytes()
             usb_key = self.host.session_state.get_cached_usb_key()
-            self.host.reset_secret_idle_timer()
             encrypt_file(
                 self.host._serialize_editor_content(),
                 self.host.saved_file_path,
@@ -146,7 +151,7 @@ class FileWorkflowController:
         finally:
             self.host.operation_mutex.unlock()
 
-    def _read_header(self, path: str, EncryptModeType) -> HeaderInfo:
+    def _read_header(self, path: str, encrypt_mode_type) -> HeaderInfo:
         with open(path, "rb") as f:
             settings = f.read(SETTINGS_SIZE)
             if len(settings) != SETTINGS_SIZE:
@@ -162,11 +167,11 @@ class FileWorkflowController:
             if header_version != HEADER_VERSION:
                 raise ValidationError(f"Unsupported file version: {header_version}")
 
-            mode = EncryptModeType(settings[2])
+            mode = encrypt_mode_type(settings[2])
             if mode not in [
-                EncryptModeType.MODE_PASSWORD_ONLY,
-                EncryptModeType.MODE_PASSWORD_PLUS_KEY,
-                EncryptModeType.MODE_KEY_ONLY,
+                encrypt_mode_type.MODE_PASSWORD_ONLY,
+                encrypt_mode_type.MODE_PASSWORD_PLUS_KEY,
+                encrypt_mode_type.MODE_KEY_ONLY,
             ]:
                 raise ValidationError(f"Unsupported encryption mode: {mode}")
 
@@ -194,7 +199,7 @@ class FileWorkflowController:
             EncryptModeType = self.host.document_service.get_encrypt_mode_type()
             encrypt_file = self.host.document_service.encrypt_file
             create_or_load_key = self.host.document_service.create_or_load_key
-            from ..ui.main_ui import EncryptModeDialog
+            from ..ui.dialogs import EncryptModeDialog
 
             dlg = EncryptModeDialog(self.host)
             if not dlg.exec_():
@@ -203,7 +208,7 @@ class FileWorkflowController:
 
             password_bytes = None
             if mode_uses_password(mode, EncryptModeType):
-                password_bytes = self._prompt_password(validate_strength=True)
+                password_bytes = self._prompt_password(validate_strength=True, confirm=True)
                 if password_bytes is None:
                     return
 
@@ -225,7 +230,7 @@ class FileWorkflowController:
                     "File Exists",
                     f"The file '{os.path.basename(path)}' already exists. Do you want to overwrite it?",
                     buttons=PangMessageBox.StandardButton.Yes | PangMessageBox.StandardButton.No,
-                    default=PangMessageBox.StandardButton.No,
+                    defaultButton=PangMessageBox.StandardButton.No,
                 )
                 if ret == PangMessageBox.StandardButton.No:
                     return
@@ -314,7 +319,7 @@ class FileWorkflowController:
             opened_header_uuid = file_uuid
 
             if mode_uses_password(mode, EncryptModeType):
-                password_bytes = self._prompt_password(validate_strength=False)
+                password_bytes = self._prompt_password(validate_strength=False, confirm=False)
                 if password_bytes is None:
                     return
 

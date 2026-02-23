@@ -46,6 +46,10 @@ for folder in ("build", "dist"):
 
 # Get the project root directory (parent of scripts/)
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+icon_path = os.path.join(project_root, "ui", "logo.ico")
+
+if not os.path.isfile(icon_path):
+    raise FileNotFoundError(f"Expected app icon not found: {icon_path}")
 
 # Main script entry point - use run.py which handles imports properly
 entry_file = os.path.join(project_root, "run.py")
@@ -57,7 +61,7 @@ pyinstaller_args = [
     "--onedir",
     "--windowed",
     "--noconfirm",
-    "--icon", os.path.join(project_root, "ui", "logo.ico"),
+    "--icon", icon_path,
     "--add-data", f"{os.path.join(project_root, 'ui')};ui",
     "--add-data", f"{os.path.join(project_root, 'version.txt')};.",
     "--version-file", os.path.join(project_root, "version.txt"),
@@ -87,6 +91,7 @@ helper_pyinstaller_args = [
     "--onefile",
     "--console",
     "--noconfirm",
+    "--icon", icon_path,
 ]
 
 PyInstaller.__main__.run(helper_pyinstaller_args)

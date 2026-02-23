@@ -7,6 +7,7 @@ from types import SimpleNamespace
 _DEFAULTS = {
     "recording_cooldown": 30,
     "screen_recording_hide_enabled": True,
+    "screen_recording_allowlist": [],
     "tab_out_hide_enabled": True,
     "tab_setting": "spaces4",
     "session_cache_enabled": True,
@@ -17,8 +18,11 @@ _DEFAULTS = {
     "mem_guard_mode": "off",
     "mem_guard_whitelist": [],
     "auto_delete_panic_files": True,
-    "mem_guard_scan_interval_ms": 50,
+    "mem_guard_scan_interval_ms": 100,
     "mem_guard_pid_cache_cap": 128,
+    "mem_guard_etw_enabled": False,
+    "mem_guard_etw_last_error": "",
+    "mem_guard_etw_permission_denied": False,
 }
 
 
@@ -36,7 +40,8 @@ class PreferencesProxy:
                 return
             self._loading = True
         try:
-            from ..utils.preferences import PangPreferences as real
+            from .preferences import initialize_preferences
+            real = initialize_preferences()
             with self._lock:
                 for key, value in self._pending.items():
                     setattr(real, key, value)
@@ -73,13 +78,15 @@ class PreferencesProxy:
                 self._pending[name] = value
 
     def save_preferences(self):
+        if not self.is_loaded():
+            self.ensure_loaded()
         if hasattr(self._target, "save_preferences"):
             self._target.save_preferences()
 
 
 class PreferencesDialogFactory:
     def __call__(self, *args, **kwargs):
-        from ..utils.preferences import PreferencesDialog as _PreferencesDialog
+        from .preferences import PreferencesDialog as _PreferencesDialog
         return _PreferencesDialog(*args, **kwargs)
 
 

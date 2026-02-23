@@ -25,7 +25,7 @@ def run_profile(iterations: int, max_entries: int, cache_cap: int):
     t0 = time.perf_counter()
     for i in range(iterations):
         s = time.perf_counter()
-        owner_map, cursor = _enumerate_reader_pids_windows(
+        owner_map, cursor, _total_count, _scanned_count = _enumerate_reader_pids_windows(
             target_pid,
             start_index=cursor,
             max_entries=max_entries,

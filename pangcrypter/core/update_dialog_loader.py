@@ -39,9 +39,9 @@ class UpdateDialogLoader:
 
         def _worker():
             try:
-                import requests  # noqa: F401
+                import requests  # type: ignore[import-untyped]  # noqa: F401
                 from packaging import version as _version  # noqa: F401
-                from ..core import updater as _updater  # noqa: F401
+                from ..updater import service as _updater  # noqa: F401
             except (ImportError, OSError, RuntimeError, ValueError):
                 # Best-effort warmup only.
                 return
@@ -54,6 +54,7 @@ class UpdateDialogLoader:
     def create_dialog(self, parent=None):
         if self._module is None:
             self._load()
+        assert self._module is not None
         return self._module.UpdateDialog(parent)
 
 

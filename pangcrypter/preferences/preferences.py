@@ -1,10 +1,12 @@
 # preferences.py
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import json
 import logging
 import os
 import platform
 import hashlib
+import subprocess
+import ctypes
 import sys
 
 from PyQt6.QtWidgets import (
@@ -18,6 +20,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QListView,
     QPushButton,
+    QLineEdit,
     QSpinBox,
     QStackedWidget,
     QVBoxLayout,
@@ -25,7 +28,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtCore import Qt, QSize
-from .mem_guard import MemGuardMode
+from ..utils.mem_guard import MemGuardMode
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +66,44 @@ def _is_mem_guard_supported() -> bool:
 
 def _estimate_scan_time_ms(**kwargs):
     try:
-        from .mem_guard import estimate_scan_time_ms
+        from ..utils.mem_guard import estimate_scan_time_ms
         return estimate_scan_time_ms(**kwargs)
     except (ImportError, OSError, RuntimeError, ValueError):
         return None
+
+
+def _is_admin_windows() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
+def _restart_app_as_admin() -> bool:
+    if os.name != "nt" or _is_admin_windows():
+        return False
+
+    if "--elevated-relaunch" in sys.argv[1:]:
+        return False
+
+    try:
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            args = sys.argv[1:] + ["--elevated-relaunch"]
+            working_dir = os.path.dirname(os.path.abspath(executable))
+        else:
+            executable = sys.executable
+            script = os.path.abspath(sys.argv[0])
+            args = [script] + sys.argv[1:] + ["--elevated-relaunch"]
+            working_dir = os.path.dirname(script)
+
+        params = subprocess.list2cmdline(args)
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, working_dir, 1)
+        return int(ret) > 32
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def _file_sha256(path: str) -> str:
@@ -285,7 +322,10 @@ class StableComboBox(QComboBox):
 
     def showPopup(self):
         super().showPopup()
-        popup = self.view().window()
+        view = self.view()
+        if view is None:
+            return
+        popup = view.window()
         if popup is None:
             return
 
@@ -312,6 +352,7 @@ class StableComboBox(QComboBox):
 class Preferences:
     recording_cooldown: int = 30
     screen_recording_hide_enabled: bool = True
+    screen_recording_allowlist: list[str] = field(default_factory=list)
     tab_out_hide_enabled: bool = True
     tab_setting: str = "spaces4"
     session_cache_enabled: bool = True
@@ -320,14 +361,19 @@ class Preferences:
     session_infocus_inactivity_reauth_enabled: bool = True
     session_infocus_inactivity_minutes: int = 5
     mem_guard_mode: str = default_mem_guard_mode()
-    mem_guard_whitelist: list[dict | str] = None
+    mem_guard_whitelist: list[dict[str, str]] = field(default_factory=list)
     auto_delete_panic_files: bool = True
-    mem_guard_scan_interval_ms: int = 50
+    mem_guard_scan_interval_ms: int = 100
     mem_guard_pid_cache_cap: int = 128
+    mem_guard_etw_enabled: bool = False
+    mem_guard_etw_last_error: str = ""
+    mem_guard_etw_permission_denied: bool = False
 
     def __post_init__(self):
         if self.mem_guard_whitelist is None:
             self.mem_guard_whitelist = []
+        if self.screen_recording_allowlist is None:
+            self.screen_recording_allowlist = []
 
     def normalize(self):
         self.session_reauth_minutes = max(1, min(5, int(self.session_reauth_minutes)))
@@ -339,10 +385,27 @@ class Preferences:
         if not self.session_cache_enabled or not _is_mem_guard_supported():
             self.mem_guard_mode = MEM_GUARD_MODE_OFF
 
-        self.mem_guard_scan_interval_ms = max(20, min(200, int(self.mem_guard_scan_interval_ms)))
+        self.mem_guard_scan_interval_ms = max(50, min(250, int(self.mem_guard_scan_interval_ms)))
         self.mem_guard_pid_cache_cap = max(32, min(512, int(self.mem_guard_pid_cache_cap)))
+        self.mem_guard_etw_enabled = bool(self.mem_guard_etw_enabled)
+        self.mem_guard_etw_last_error = str(self.mem_guard_etw_last_error or "")[:256]
+        self.mem_guard_etw_permission_denied = bool(self.mem_guard_etw_permission_denied)
 
         self.mem_guard_mode = _mem_guard_mode_to_storage_value(self.mem_guard_mode)
+
+        if not isinstance(self.screen_recording_allowlist, list):
+            self.screen_recording_allowlist = []
+        cleaned_allowlist: list[str] = []
+        seen_allowlist: set[str] = set()
+        for item in self.screen_recording_allowlist:
+            name = str(item or "").strip().lower()
+            if not name:
+                continue
+            if name in seen_allowlist:
+                continue
+            seen_allowlist.add(name)
+            cleaned_allowlist.append(name)
+        self.screen_recording_allowlist = cleaned_allowlist
 
         if not isinstance(self.mem_guard_whitelist, list):
             self.mem_guard_whitelist = []
@@ -432,7 +495,15 @@ class Preferences:
 
 
 PangPreferences = Preferences()
-PangPreferences.load_preferences()
+_PREFERENCES_LOADED = False
+
+
+def initialize_preferences() -> Preferences:
+    global _PREFERENCES_LOADED
+    if not _PREFERENCES_LOADED:
+        PangPreferences.load_preferences()
+        _PREFERENCES_LOADED = True
+    return PangPreferences
 
 
 class PreferencesDialog(QDialog):
@@ -490,6 +561,12 @@ class PreferencesDialog(QDialog):
         self.disable_recording_hide.setChecked(not PangPreferences.screen_recording_hide_enabled)
         layout.addWidget(self.disable_recording_hide)
 
+        layout.addWidget(QLabel("Allowed recording process names (comma-separated):"))
+        self.recording_allowlist_edit = QLineEdit()
+        self.recording_allowlist_edit.setPlaceholderText("example: obs64.exe, sharex.exe")
+        self.recording_allowlist_edit.setText(", ".join(PangPreferences.screen_recording_allowlist or []))
+        layout.addWidget(self.recording_allowlist_edit)
+
         self.disable_tabbing_hide = QCheckBox("Disable hiding editor on tab out (unsafe)")
         self.disable_tabbing_hide.setChecked(not PangPreferences.tab_out_hide_enabled)
         layout.addWidget(self.disable_tabbing_hide)
@@ -544,9 +621,24 @@ class PreferencesDialog(QDialog):
 
         layout.addWidget(QLabel("Memory guard scan interval (ms):"))
         self.scan_interval_spin = QSpinBox()
-        self.scan_interval_spin.setRange(20, 200)
+        self.scan_interval_spin.setRange(50, 250)
         self.scan_interval_spin.setValue(PangPreferences.mem_guard_scan_interval_ms)
+        self.scan_interval_spin.setToolTip("Lower intervals increase CPU usage.")
         layout.addWidget(self.scan_interval_spin)
+
+        self.mem_guard_etw_enabled = QCheckBox("Enhanced detection (ETW process watcher)")
+        self.mem_guard_etw_enabled.setChecked(bool(getattr(PangPreferences, "mem_guard_etw_enabled", False)))
+        layout.addWidget(self.mem_guard_etw_enabled)
+
+        self.mem_guard_etw_status_label = QLabel("")
+        self.mem_guard_etw_status_label.setObjectName("MemGuardEtwStatus")
+        self.mem_guard_etw_status_label.setStyleSheet("color: #9ca3af;")
+        layout.addWidget(self.mem_guard_etw_status_label)
+
+        self.mem_guard_etw_restart_admin_btn = QPushButton("Restart as Administrator")
+        self.mem_guard_etw_restart_admin_btn.clicked.connect(self._restart_as_admin_for_etw)
+        self.mem_guard_etw_restart_admin_btn.hide()
+        layout.addWidget(self.mem_guard_etw_restart_admin_btn)
 
         layout.addWidget(QLabel("PID handle cache cap:"))
         self.cache_cap_spin = QSpinBox()
@@ -657,6 +749,7 @@ class PreferencesDialog(QDialog):
             self.scan_interval_spin,
             self.cache_cap_spin,
             self.scan_estimate_button,
+            self.mem_guard_etw_enabled,
             self.whitelist_list,
             self.whitelist_add_btn,
             self.whitelist_remove_btn,
@@ -671,6 +764,34 @@ class PreferencesDialog(QDialog):
         else:
             self.mem_guard_info.setText("Memory guard will monitor suspicious process memory access.")
 
+        if not enabled:
+            self.mem_guard_etw_status_label.setText("")
+            self.mem_guard_etw_restart_admin_btn.hide()
+            return
+
+        if bool(getattr(PangPreferences, "mem_guard_etw_enabled", False)) and str(getattr(PangPreferences, "mem_guard_etw_last_error", "")):
+            if bool(getattr(PangPreferences, "mem_guard_etw_permission_denied", False)):
+                self.mem_guard_etw_status_label.setText(
+                    "Process watcher unavailable (access denied). Run as Administrator to enable ETW hints."
+                )
+                self.mem_guard_etw_restart_admin_btn.setVisible(True)
+                self.mem_guard_etw_restart_admin_btn.setEnabled(os.name == "nt")
+            else:
+                self.mem_guard_etw_status_label.setText(
+                    "Process watcher unavailable on this system. Running in polling mode."
+                )
+                self.mem_guard_etw_restart_admin_btn.hide()
+        else:
+            self.mem_guard_etw_status_label.setText("")
+            self.mem_guard_etw_restart_admin_btn.hide()
+
+    def _restart_as_admin_for_etw(self):
+        launched = _restart_app_as_admin()
+        if launched:
+            self.mem_guard_etw_status_label.setText("Elevation prompt shown. You can close this window after approving.")
+            return
+        self.mem_guard_etw_status_label.setText("Could not start elevated restart. Continuing in polling mode.")
+
     def _add_whitelist_entry(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select executable to whitelist")
         if not path:
@@ -682,6 +803,8 @@ class PreferencesDialog(QDialog):
         canonical = os.path.normcase(path)
         for i in range(self.whitelist_list.count()):
             existing_item = self.whitelist_list.item(i)
+            if existing_item is None:
+                continue
             payload = existing_item.data(Qt.ItemDataRole.UserRole) or {}
             existing_path = os.path.normcase(str(payload.get("path", "")))
             if existing_path == canonical:
@@ -761,6 +884,11 @@ class PreferencesDialog(QDialog):
     def accept(self):
         PangPreferences.recording_cooldown = self.cooldown_spin.value()
         PangPreferences.screen_recording_hide_enabled = not self.disable_recording_hide.isChecked()
+        PangPreferences.screen_recording_allowlist = [
+            item.strip().lower()
+            for item in self.recording_allowlist_edit.text().split(",")
+            if item.strip()
+        ]
         PangPreferences.tab_out_hide_enabled = not self.disable_tabbing_hide.isChecked()
         PangPreferences.session_cache_enabled = self.enable_session_cache.isChecked()
         PangPreferences.session_reauth_on_focus_loss = self.session_reauth_on_focus_loss.isChecked()
@@ -771,6 +899,7 @@ class PreferencesDialog(QDialog):
 
         PangPreferences.mem_guard_scan_interval_ms = self.scan_interval_spin.value()
         PangPreferences.mem_guard_pid_cache_cap = self.cache_cap_spin.value()
+        PangPreferences.mem_guard_etw_enabled = self.mem_guard_etw_enabled.isChecked()
         requested_mode = self.mem_guard_combo.currentData()
         if not PangPreferences.session_cache_enabled or not _is_mem_guard_supported():
             PangPreferences.mem_guard_mode = MEM_GUARD_MODE_OFF
@@ -780,6 +909,8 @@ class PreferencesDialog(QDialog):
         whitelist_items: list[dict] = []
         for i in range(self.whitelist_list.count()):
             item = self.whitelist_list.item(i)
+            if item is None:
+                continue
             payload = item.data(Qt.ItemDataRole.UserRole) or {}
             path = str(payload.get("path", "")).strip()
             sha = str(payload.get("sha256", "")).strip().lower()

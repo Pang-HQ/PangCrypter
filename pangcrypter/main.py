@@ -14,12 +14,12 @@ from .core.document_service import DocumentService
 from .core.file_workflow_controller import FileWorkflowController
 from .core.format_config import CONTENT_MODE_HTML, CONTENT_MODE_PLAINTEXT, HEADER_VERSION, SETTINGS_SIZE
 from .core.mem_guard_alert_controller import MemGuardAlertController
-from .core.preferences_proxy import PangPreferences, PreferencesDialog
+from .preferences.proxy import PangPreferences, PreferencesDialog
 from .core.privacy_guard_controller import PrivacyGuardController
 from .core.runtime_services_controller import RuntimeServicesController
 from .core.session_state import SessionState
 from .core.update_dialog_loader import update_dialog_loader
-from .ui.main_ui import EditorWidget
+from .ui.editor_widget import EditorWidget
 from .ui.messagebox import PangMessageBox
 from .utils.app_style import apply_app_stylesheet
 from .utils.logger import configure_logging, enable_deferred_file_logging
@@ -39,6 +39,17 @@ def is_mem_guard_supported() -> bool:
 class MainWindow(QMainWindow):
     MAX_SECRET_CACHE_IDLE_MINUTES = 15
     DEFAULT_SECRET_CACHE_IDLE_MINUTES = 5
+    AUTOSAVE_DEBOUNCE_MS = 1000
+    UI_COOLDOWN_TICK_MS = 1000
+    UPDATER_PRELOAD_DELAY_MS = 100
+    DEFERRED_PREFS_PRELOAD_MS = 50
+    DEFERRED_RUNTIME_SERVICES_START_MS = 50
+    SECRET_IDLE_MINUTE_TO_MS = 60 * 1000
+
+    @staticmethod
+    def _set_action_shortcut(action, shortcut: str) -> None:
+        if action is not None:
+            action.setShortcut(shortcut)
 
     def __init__(self):
         super().__init__()
@@ -46,9 +57,11 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._init_timers()
         self.installEventFilter(self)
-        self.menuBar().setEnabled(False)
+        menu_bar = self.menuBar()
+        if menu_bar is not None:
+            menu_bar.setEnabled(False)
         QTimer.singleShot(0, self._after_first_paint_init)
-        QTimer.singleShot(50, PangPreferences.preload_async)
+        QTimer.singleShot(self.DEFERRED_PREFS_PRELOAD_MS, PangPreferences.preload_async)
 
     def _init_state(self):
         self.session_state = SessionState()
@@ -105,20 +118,25 @@ class MainWindow(QMainWindow):
         self.hidden_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.hidden_label.setWordWrap(True)
         self.hidden_label.hide()
-        self.hidden_label.mousePressEvent = self.privacy_guard.on_hidden_label_clicked
+        self.hidden_label.mousePressEvent = self._on_hidden_label_mouse_press
         self._layout_hidden_label()
 
+    def _on_hidden_label_mouse_press(self, ev):
+        self.privacy_guard.on_hidden_label_clicked(ev)
+
     def _init_timers(self):
-        self.autosave_timer = QTimer(singleShot=True)
-        self.autosave_timer.setInterval(1000)
+        self.autosave_timer = QTimer()
+        self.autosave_timer.setSingleShot(True)
+        self.autosave_timer.setInterval(self.AUTOSAVE_DEBOUNCE_MS)
         self.autosave_timer.timeout.connect(self.autosave)
         self.editor.textChanged.connect(lambda: self.autosave_timer.start())
         self.editor.textChanged.connect(self._on_editor_activity)
 
-        self.secret_idle_timer = QTimer(singleShot=True)
+        self.secret_idle_timer = QTimer()
+        self.secret_idle_timer.setSingleShot(True)
         self.secret_idle_timer.timeout.connect(self._on_infocus_inactivity_timeout)
         self.cooldown_timer = QTimer()
-        self.cooldown_timer.setInterval(1000)
+        self.cooldown_timer.setInterval(self.UI_COOLDOWN_TICK_MS)
         self.cooldown_timer.timeout.connect(self.privacy_guard.update_cooldown)
         self.usb_cache_timer = QTimer()
         self.usb_cache_timer.timeout.connect(self.refresh_usb_cache)
@@ -126,35 +144,53 @@ class MainWindow(QMainWindow):
     def _after_first_paint_init(self):
         self._build_menus()
         self._warn_secret_cache_limit()
-        self.menuBar().setEnabled(True)
+        menu_bar = self.menuBar()
+        if menu_bar is not None:
+            menu_bar.setEnabled(True)
         QTimer.singleShot(0, update_dialog_loader.preload_async)
-        QTimer.singleShot(100, update_dialog_loader.preload_backend_async)
-        QTimer.singleShot(50, self.runtime_services.start_deferred_services)
+        QTimer.singleShot(self.UPDATER_PRELOAD_DELAY_MS, update_dialog_loader.preload_backend_async)
+        QTimer.singleShot(self.DEFERRED_RUNTIME_SERVICES_START_MS, self.runtime_services.start_deferred_services)
 
     def _build_menus(self):
-        fm = self.menuBar().addMenu("&File")
-        fm.addAction("&Open", self.open_file).setShortcut("Ctrl+O")
-        fm.addAction("&Save", self.on_save_triggered).setShortcut("Ctrl+S")
-        fm.addAction("Save &As", self.save_file).setShortcut("Ctrl+Shift+S")
-        fm.addAction("&Close", self.close_file).setShortcut("Ctrl+W")
-        fm.addAction("&Preferences", self.open_preferences_dialog).setShortcut("Ctrl+,")
+        menu_bar = self.menuBar()
+        if menu_bar is None:
+            return
 
-        em = self.menuBar().addMenu("&Edit")
-        em.addAction("&Undo", self.editor.undo).setShortcut("Ctrl+Z")
-        em.addAction("&Redo", self.editor.redo).setShortcut("Ctrl+Y")
-        em.addSeparator()
-        em.addAction("Cu&t", self.editor.cut).setShortcut("Ctrl+X")
-        em.addAction("&Copy", self.editor.copy).setShortcut("Ctrl+C")
-        em.addAction("&Paste", self.editor.paste).setShortcut("Ctrl+V")
-        em.addSeparator()
-        em.addAction("Select &All", self.editor.selectAll).setShortcut("Ctrl+A")
-        em.addSeparator()
-        em.addAction("Reset Formatting", self.editor.reset_formatting).setShortcut("Ctrl+Space")
-        em.addAction("Increase Font Size", lambda: self.editor.change_font_size(1)).setShortcut("Ctrl+Shift+>")
-        em.addAction("Decrease Font Size", lambda: self.editor.change_font_size(-1)).setShortcut("Ctrl+Shift+<")
+        fm = menu_bar.addMenu("&File")
+        if fm is None:
+            return
+        self._set_action_shortcut(fm.addAction("&Open", self.open_file), "Ctrl+O")
+        self._set_action_shortcut(fm.addAction("&Save", self.on_save_triggered), "Ctrl+S")
+        self._set_action_shortcut(fm.addAction("Save &As", self.save_file), "Ctrl+Shift+S")
+        self._set_action_shortcut(fm.addAction("&Close", self.close_file), "Ctrl+W")
+        self._set_action_shortcut(fm.addAction("&Preferences", self.open_preferences_dialog), "Ctrl+,")
 
-        hm = self.menuBar().addMenu("&Help")
-        hm.addAction("&Help", self.open_help_page).setShortcut("F1")
+        em = menu_bar.addMenu("&Edit")
+        if em is None:
+            return
+        self._set_action_shortcut(em.addAction("&Undo", self.editor.undo), "Ctrl+Z")
+        self._set_action_shortcut(em.addAction("&Redo", self.editor.redo), "Ctrl+Y")
+        em.addSeparator()
+        self._set_action_shortcut(em.addAction("Cu&t", self.editor.cut), "Ctrl+X")
+        self._set_action_shortcut(em.addAction("&Copy", self.editor.copy), "Ctrl+C")
+        self._set_action_shortcut(em.addAction("&Paste", self.editor.paste), "Ctrl+V")
+        em.addSeparator()
+        self._set_action_shortcut(em.addAction("Select &All", self.editor.selectAll), "Ctrl+A")
+        em.addSeparator()
+        self._set_action_shortcut(em.addAction("Reset Formatting", self.editor.reset_formatting), "Ctrl+Space")
+        self._set_action_shortcut(
+            em.addAction("Increase Font Size", lambda: self.editor.change_font_size(1)),
+            "Ctrl+Shift+>",
+        )
+        self._set_action_shortcut(
+            em.addAction("Decrease Font Size", lambda: self.editor.change_font_size(-1)),
+            "Ctrl+Shift+<",
+        )
+
+        hm = menu_bar.addMenu("&Help")
+        if hm is None:
+            return
+        self._set_action_shortcut(hm.addAction("&Help", self.open_help_page), "F1")
         hm.addAction("&Check for Updates", self.open_update_dialog)
 
     def open_help_page(self):
@@ -208,6 +244,10 @@ class MainWindow(QMainWindow):
         dlg = PreferencesDialog(self)
         if dlg.exec():
             self.editor.set_tab_setting(PangPreferences.tab_setting)
+            if self.screen_recorder_checker is not None:
+                self.screen_recorder_checker.set_allowlist(
+                    set(getattr(PangPreferences, "screen_recording_allowlist", []) or [])
+                )
             self.reset_secret_idle_timer()
             self._ensure_mem_guard_controller().configure()
 
@@ -313,7 +353,7 @@ class MainWindow(QMainWindow):
 
     def reset_secret_idle_timer(self):
         if PangPreferences.session_cache_enabled and PangPreferences.session_infocus_inactivity_reauth_enabled:
-            self.secret_idle_timer.setInterval(self._effective_secret_cache_idle_minutes() * 60 * 1000)
+            self.secret_idle_timer.setInterval(self._effective_secret_cache_idle_minutes() * self.SECRET_IDLE_MINUTE_TO_MS)
             self.secret_idle_timer.start()
         else:
             self.secret_idle_timer.stop()
@@ -344,7 +384,7 @@ class MainWindow(QMainWindow):
                 "Close File",
                 "Are you sure you want to close the current file? Unsaved changes will be lost.",
                 buttons=PangMessageBox.StandardButton.Yes | PangMessageBox.StandardButton.No,
-                default=PangMessageBox.StandardButton.No,
+                defaultButton=PangMessageBox.StandardButton.No,
             )
             if ret == PangMessageBox.StandardButton.No:
                 return
@@ -414,20 +454,20 @@ class MainWindow(QMainWindow):
             self.setWindowTitle("PangCrypter")
         self.update_file_info_label()
 
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.WindowActivate:
+    def eventFilter(self, a0, a1):
+        if a1 is not None and a1.type() == QEvent.Type.WindowActivate:
             self.privacy_guard.on_window_activate()
-        elif event.type() == QEvent.Type.WindowDeactivate:
+        elif a1 is not None and a1.type() == QEvent.Type.WindowDeactivate:
             self.privacy_guard.on_window_deactivate()
-        return super().eventFilter(obj, event)
+        return super().eventFilter(a0, a1)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
+    def resizeEvent(self, a0):
+        super().resizeEvent(a0)
         self._layout_hidden_label()
 
-    def closeEvent(self, event):
+    def closeEvent(self, a0):
         self.runtime_services.stop_all()
-        super().closeEvent(event)
+        super().closeEvent(a0)
 
 
 def main():
@@ -446,7 +486,7 @@ def main():
         try:
             win.open_file(file_arg)
         except (OSError, RuntimeError, ValueError) as e:
-            print(f"Failed to open {file_arg}: {e}")
+            logger.error("Failed to open %s: %s", file_arg, e)
 
     win.show()
     if args.debug:

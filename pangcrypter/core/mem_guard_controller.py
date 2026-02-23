@@ -25,6 +25,7 @@ class MemGuardController:
         self._loader_thread: Optional[threading.Thread] = None
         self._bootstrap_timer: Optional[QTimer] = None
         self._started = False
+        self._etw_status_notice_shown = False
 
     def start(self):
         if self._started:
@@ -121,12 +122,14 @@ class MemGuardController:
 
     def _on_bootstrap_tick(self):
         if self._load_error:
-            self._bootstrap_timer.stop()
+            if self._bootstrap_timer is not None:
+                self._bootstrap_timer.stop()
             self.logger.warning("Memory guard module failed to load asynchronously: %s", self._load_error)
             return
 
         if self._module_ready:
-            self._bootstrap_timer.stop()
+            if self._bootstrap_timer is not None:
+                self._bootstrap_timer.stop()
             self.configure()
 
     def _ensure_self_whitelist(self):
@@ -192,11 +195,48 @@ class MemGuardController:
             whitelist=self.preferences.mem_guard_whitelist,
             check_interval_ms=self.preferences.mem_guard_scan_interval_ms,
             pid_handle_cache_cap=self.preferences.mem_guard_pid_cache_cap,
+            enhanced_detection_enabled=bool(getattr(self.preferences, "mem_guard_etw_enabled", False)),
         )
         self.mem_guard_checker.moveToThread(self.mem_guard_thread)
         self.mem_guard_thread.started.connect(self.mem_guard_checker.run)
         self.mem_guard_checker.memory_probe_detected.connect(self.host.on_memory_probe_detected)
+        if hasattr(self.mem_guard_checker, "process_watcher_status_changed"):
+            self.mem_guard_checker.process_watcher_status_changed.connect(self._on_process_watcher_status_changed)
+            self._on_process_watcher_status_changed(getattr(self.mem_guard_checker, "process_watcher_status", None))
         self.mem_guard_thread.start()
+
+    def _on_process_watcher_status_changed(self, status) -> None:
+        if status is None:
+            return
+        enabled = bool(getattr(self.preferences, "mem_guard_etw_enabled", False))
+        reason = str(getattr(status, "reason", "") or "")
+        permission_denied = bool(getattr(status, "permission_denied", False))
+        available = bool(getattr(status, "available", False))
+
+        changed = False
+        if str(getattr(self.preferences, "mem_guard_etw_last_error", "") or "") != reason:
+            self.preferences.mem_guard_etw_last_error = reason
+            changed = True
+        if bool(getattr(self.preferences, "mem_guard_etw_permission_denied", False)) != permission_denied:
+            self.preferences.mem_guard_etw_permission_denied = permission_denied
+            changed = True
+        if changed and hasattr(self.preferences, "save_preferences"):
+            self.preferences.save_preferences()
+
+        if not enabled or available or self._etw_status_notice_shown:
+            return
+
+        if permission_denied:
+            self.host.status_bar.showMessage(
+                "Enhanced detection unavailable without Administrator privileges. Using polling mode.",
+                6000,
+            )
+        else:
+            self.host.status_bar.showMessage(
+                "Process watcher unavailable on this system. Using polling mode.",
+                6000,
+            )
+        self._etw_status_notice_shown = True
 
     def stop(self) -> bool:
         if self.mem_guard_checker is not None:

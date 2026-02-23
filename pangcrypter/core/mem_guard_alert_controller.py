@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
+from collections import deque
 from typing import Any
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QMessageBox
 
-from ..core.preferences_proxy import PangPreferences
+from ..preferences.proxy import PangPreferences
 from ..ui.messagebox import PangMessageBox
 
 
@@ -13,7 +15,7 @@ class MemGuardAlertController:
     def __init__(self, host):
         self.host = host
         self._handling = False
-        self._pending_findings: list[Any] = []
+        self._pending_findings: deque[Any] = deque()
         self._pending_keys: set[tuple[int, str, int, str]] = set()
 
     def enqueue(self, finding: Any) -> None:
@@ -36,7 +38,7 @@ class MemGuardAlertController:
         if self._handling or not self._pending_findings:
             return
 
-        finding = self._pending_findings.pop(0)
+        finding = self._pending_findings.popleft()
         key = (
             int(finding.pid),
             finding.severity.value,
@@ -54,16 +56,18 @@ class MemGuardAlertController:
             self.host.privacy_guard.hide_editor_and_show_label()
 
             msg = PangMessageBox(self.host)
-            msg.setWindowTitle("Memory Access Warning")
+            msg.setWindowTitle("Potential Memory Access")
             details = (
-                f"Process \"{finding.process_name}\" (PID {finding.pid}) appears to be reading process memory.\n\n"
-                "If this is expected behaviour (for example anti-cheat/EDR), you can continue.\n"
+                f"Process \"{finding.process_name}\" (PID {finding.pid}) has permissions that allow it to read PangCrypter's memory.\n\n"
+                "This does not confirm that memory was read; it only indicates this process could read it.\n\n"
+                "If this is expected behaviour (for example anti-cheat, EDR, or overlays), you can continue or whitelist this application."
             )
             if not panic_saved:
                 details += "\nWarning: could not save panic snapshot, unsaved work may be lost."
             msg.setText(details)
-            msg.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
-            whitelist_btn = msg.addButton("Continue + whitelist application", QMessageBox.ButtonRole.AcceptRole)
+            continue_btn = msg.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+            remember_btn = msg.addButton("Continue and remember this app hash", QMessageBox.ButtonRole.AcceptRole)
+            whitelist_btn = msg.addButton("Whitelist this application", QMessageBox.ButtonRole.AcceptRole)
             exit_btn = msg.addButton("Exit program", QMessageBox.ButtonRole.DestructiveRole)
             msg.setMinimumWidth(640)
             msg.adjustSize()
@@ -76,26 +80,25 @@ class MemGuardAlertController:
                 self.host.close()
                 return
 
-            confirm = PangMessageBox.question(
-                self.host,
-                "Risk Confirmation",
-                "I understand the risks and want to continue.",
-                buttons=PangMessageBox.StandardButton.Yes | PangMessageBox.StandardButton.No,
-                default=PangMessageBox.StandardButton.No,
-            )
-            if confirm != PangMessageBox.StandardButton.Yes:
-                self.host.close()
-                return
+            should_remember = clicked in (remember_btn, whitelist_btn)
+            if clicked == continue_btn:
+                should_remember = False
 
-            if clicked == whitelist_btn and finding.process_path:
+            if should_remember and finding.process_path:
                 current_entries = PangPreferences.mem_guard_whitelist
+                candidate_path = os.path.normcase(os.path.abspath(str(finding.process_path)))
+                candidate_sha = str(finding.sha256 or "").lower()
                 exists = False
                 for item in current_entries:
-                    if isinstance(item, dict) and item.get("path") == finding.process_path and str(item.get("sha256", "")).lower() == finding.sha256.lower():
+                    if not isinstance(item, dict):
+                        continue
+                    existing_path = os.path.normcase(os.path.abspath(str(item.get("path", ""))))
+                    existing_sha = str(item.get("sha256", "")).lower()
+                    if existing_path == candidate_path and existing_sha == candidate_sha:
                         exists = True
                         break
                 if not exists:
-                    PangPreferences.mem_guard_whitelist.append({"path": finding.process_path, "sha256": finding.sha256})
+                    PangPreferences.mem_guard_whitelist.append({"path": os.path.abspath(str(finding.process_path)), "sha256": candidate_sha})
                     PangPreferences.save_preferences()
                     self.host.mem_guard_controller.configure()
 
