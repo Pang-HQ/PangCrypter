@@ -2,6 +2,6 @@
 PangCrypter - A secure text editor with encryption capabilities.
 """
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 __author__ = "Pang HQ"
 __description__ = "Secure text editor."
