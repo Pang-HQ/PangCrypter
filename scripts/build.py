@@ -133,7 +133,7 @@ if os.path.exists(dist_dir):
                 arcname = os.path.join(pangcrypter_folder, rel_path)
                 zipf.write(file_path, arcname)
 
-    print(f"\n✅ ZIP distribution created: {os.path.join(dist_dir, zip_name)}")
+    print(f"\nZIP distribution created: {os.path.join(dist_dir, zip_name)}")
     print(f"   Contents: full onedir bundle in {pangcrypter_folder}/")
 
-print("\n✅ Build complete! Check the 'dist' folder for PangCrypter/ and PangCrypter.zip")
+print("\nBuild complete! Check the 'dist' folder for PangCrypter/ and PangCrypter.zip")

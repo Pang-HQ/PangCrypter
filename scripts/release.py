@@ -349,9 +349,9 @@ def write_release_notes(version: str, checksum: str) -> Path:
     notes_path = DIST_DIR / RELEASE_NOTES_NAME
     content = (
         f"# PangCrypter v{version}\n\n"
-        f"## ✅ Checksums\n"
+        f"## Checksums\n"
         f"{ZIP_NAME}  {checksum}\n\n"
-        f"## 📝 Changes\n"
+        f"## Changes\n"
         f"- (write changes here)\n"
     )
     notes_path.write_text(content, encoding="utf-8")
@@ -362,7 +362,7 @@ def open_in_vscode(path: Path) -> None:
     print(f"\n▶ Opening release notes in VS Code: {path}")
     code_bin = shutil.which("code")
     if not code_bin:
-        print("ℹ️ VS Code CLI ('code') not found on PATH; edit release notes manually.")
+        print("VS Code CLI ('code') not found on PATH; edit release notes manually.")
         return
 
     try:
@@ -592,7 +592,7 @@ def main() -> int:
                 minisign_public_key=minisign_pubkey,
             )
 
-            print("\n✅ Refreshed current release artifacts with rebuilt update helper.")
+            print("\nRefreshed current release artifacts with rebuilt update helper.")
             print(f"   Version: v{current_version}")
             print(f"   ZIP: {zip_path}")
             print(f"   SHA256: {checksum_path}")
@@ -648,7 +648,7 @@ def main() -> int:
             )
             print_release_summary(gh_bin, version)
 
-            print("\n✅ Release published successfully (continue mode).")
+            print("\nRelease published successfully (continue mode).")
             return 0
 
         print("\n▶ Updating version files...")
@@ -725,10 +725,10 @@ def main() -> int:
         )
         print_release_summary(gh_bin, version)
 
-        print("\n✅ Release published successfully.")
+        print("\nRelease published successfully.")
         return 0
     except Exception as exc:
-        print(f"\n❌ {exc}")
+        print(f"\n Error: {exc}")
         print("Rolling back version files...")
         restore_version_files(backup)
         return 1
