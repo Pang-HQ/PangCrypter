@@ -89,7 +89,8 @@ helper_pyinstaller_args = [
     helper_entry_file,
     "--name", "PangApplyUpdate",
     "--onefile",
-    "--console",
+    "--windowed",
+    "--uac-admin",
     "--noconfirm",
     "--icon", icon_path,
 ]

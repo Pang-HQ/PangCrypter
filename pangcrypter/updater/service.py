@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import zipfile
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -498,7 +499,19 @@ class AutoUpdater:
             cmd.extend(["--session-root", session_root])
 
         try:
-            subprocess.Popen(cmd, close_fds=True)
+            # Always request elevation for the external applier on Windows.
+            # If this fails, do not continue because the app is about to quit.
+            params = subprocess.list2cmdline(cmd[1:])
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "runas",
+                cmd[0],
+                params,
+                os.path.dirname(cmd[0]),
+                0,
+            )
+            if ret <= 32:
+                raise OSError(f"ShellExecuteW failed with code {ret}")
         except OSError as e:
             raise UpdaterError(f"Failed to launch external update helper: {e}") from e
         return True

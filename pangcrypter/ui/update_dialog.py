@@ -560,11 +560,6 @@ class UpdateDialog(QDialog):
                 self.progress_text.setText("Installation completed — NOT verified publisher signature")
 
             if report.external_apply_started:
-                PangMessageBox.information(
-                    self,
-                    "Update in Progress",
-                    "Update files were verified and handed off to installer helper. PangCrypter will now close and reopen when update is complete.",
-                )
                 self.accept()
                 QApplication.quit()
             else:
