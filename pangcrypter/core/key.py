@@ -32,14 +32,7 @@ SECRET_FILE = f"{KEY_FOLDER}/secret.bin"
 KEY_VERSION = 0x01
 
 _HWID_CACHE: dict[str, bytes] = {}
-
-keyring_module: Any | None
-try:
-    import keyring as keyring_module
-except ImportError:
-    keyring_module = None
-
-KEYRING_SERVICE = "PangCrypter"
+_DRIVE_SECRET_CACHE: dict[str, bytes] = {}
 
 
 def get_file_id(path: str) -> str:
@@ -71,10 +64,6 @@ def get_file_id(path: str) -> str:
     uuid_bytes = salt_and_uuid[SALT_SIZE:SALT_SIZE + UUID_SIZE]
 
     return uuid_bytes.hex()
-
-
-def _drive_keyring_id(drive_root: str) -> str:
-    return f"drive_secret::{os.path.abspath(drive_root)}"
 
 
 def _read_secret_from_file(secret_path: str) -> Optional[bytes]:
@@ -189,45 +178,26 @@ def get_or_create_drive_secret(drive_root: str) -> bytes:
     - The canonical secret is stored on the USB itself at
       .pangcrypt_keys/secret.bin so encrypted material remains usable across
       machines with the same USB.
-    - OS keyring, when available, is best-effort convenience cache only.
-
-    Backward compatibility:
-    - Older installs may have stored the secret only in keyring.
-      If found, migrate it to secret.bin on the drive.
+    - No OS keyring fallback is used. The USB secret file is the only
+      supported source of truth.
     """
     folder = os.path.join(drive_root, KEY_FOLDER)
     secret_path = os.path.join(folder, "secret.bin")
+    cache_key = os.path.normcase(os.path.abspath(drive_root))
+
+    cached = _DRIVE_SECRET_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     secret = _read_secret_from_file(secret_path)
     if secret is not None:
-        if keyring_module:
-            try:
-                keyring_module.set_password(KEYRING_SERVICE, _drive_keyring_id(drive_root), secret.hex())
-            except RuntimeError as e:
-                logger.warning("Failed to sync drive secret to keyring: %s", e)
+        _DRIVE_SECRET_CACHE[cache_key] = secret
         return secret
-
-    if keyring_module:
-        try:
-            stored = keyring_module.get_password(KEYRING_SERVICE, _drive_keyring_id(drive_root))
-            if stored:
-                secret = bytes.fromhex(stored)
-                if len(secret) != KEY_SIZE:
-                    raise ValueError("Invalid drive secret size in keyring")
-                _write_secret_to_file(folder, secret_path, secret)
-                return secret
-        except (ValueError, RuntimeError, OSError) as e:
-            logger.warning("Failed to migrate drive secret from keyring: %s", e)
 
     secret = os.urandom(KEY_SIZE)
     _write_secret_to_file(folder, secret_path, secret)
 
-    if keyring_module:
-        try:
-            keyring_module.set_password(KEYRING_SERVICE, _drive_keyring_id(drive_root), secret.hex())
-        except RuntimeError as e:
-            logger.warning("Failed to store drive secret in keyring: %s", e)
-
+    _DRIVE_SECRET_CACHE[cache_key] = secret
     return secret
 
 def encrypt_random_key(random_key: bytes, hardware_id: bytes, drive_secret: bytes) -> bytes:
@@ -418,10 +388,12 @@ def generate_secure_key() -> bytes:
 def get_key_path(drive_root: str, uuid: UUID) -> str:
     """Returns the full path to the key file inside the hidden folder."""
     folder = os.path.join(drive_root, KEY_FOLDER)
-    os.makedirs(folder, exist_ok=True)
-    _set_posix_permissions(folder, is_dir=True)
-    _set_hidden_windows_folder(folder)
-    _set_windows_restrictive_acl(folder, is_dir=True)
+    folder_preexisting = os.path.isdir(folder)
+    if not folder_preexisting:
+        os.makedirs(folder, exist_ok=True)
+        _set_posix_permissions(folder, is_dir=True)
+        _set_hidden_windows_folder(folder)
+        _set_windows_restrictive_acl(folder, is_dir=True)
 
     if not uuid:
         raise ValueError("UUID must be provided to generate key path.")
@@ -485,6 +457,8 @@ def create_or_load_key(drive_name: str, path: str, uuid: Optional[UUID] = None, 
         return None, None
 
     return random_key, file_uuid
+
+
 
 
 

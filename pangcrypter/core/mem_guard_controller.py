@@ -26,6 +26,7 @@ class MemGuardController:
         self._bootstrap_timer: Optional[QTimer] = None
         self._started = False
         self._etw_status_notice_shown = False
+        self._active_config_signature: tuple | None = None
 
     def start(self):
         if self._started:
@@ -173,17 +174,15 @@ class MemGuardController:
         if self._disabled_until_restart or not self._module_ready:
             return
 
-        if not self.stop():
-            self.logger.error("Skipping mem guard reconfiguration because previous worker is still shutting down")
-            self._disabled_until_restart = True
-            self.host.status_bar.showMessage("Memory guard disabled until restart (worker did not stop cleanly)", 8000)
-            return
-
         if not self.preferences.session_cache_enabled:
+            self.stop()
+            self._active_config_signature = None
             return
 
         is_supported = self._api.get("is_mem_guard_supported", lambda: False)
         if not is_supported():
+            self.stop()
+            self._active_config_signature = None
             return
 
         MemGuardMode = self._api["MemGuardMode"]
@@ -191,8 +190,42 @@ class MemGuardController:
         try:
             mode = self._parse_mode(self.preferences.mem_guard_mode, MemGuardMode)
         except (KeyError, ValueError):
+            self.stop()
+            self._active_config_signature = None
             return
         if mode == MemGuardMode.OFF:
+            self.stop()
+            self._active_config_signature = None
+            return
+
+        whitelist_sig = tuple(
+            (
+                os.path.normcase(os.path.abspath(str(item.get("path", "")))),
+                str(item.get("sha256", "")).strip().lower(),
+            )
+            for item in (self.preferences.mem_guard_whitelist or [])
+            if isinstance(item, dict)
+        )
+        target_signature = (
+            str(mode.name),
+            int(self.preferences.mem_guard_scan_interval_ms),
+            int(self.preferences.mem_guard_pid_cache_cap),
+            bool(getattr(self.preferences, "mem_guard_etw_enabled", False)),
+            whitelist_sig,
+        )
+
+        if (
+            self.mem_guard_checker is not None
+            and self.mem_guard_thread is not None
+            and self.mem_guard_thread.isRunning()
+            and self._active_config_signature == target_signature
+        ):
+            return
+
+        if not self.stop():
+            self.logger.error("Skipping mem guard reconfiguration because previous worker is still shutting down")
+            self._disabled_until_restart = True
+            self.host.status_bar.showMessage("Memory guard disabled until restart (worker did not stop cleanly)", 8000)
             return
 
         self._ensure_self_whitelist()
@@ -212,6 +245,7 @@ class MemGuardController:
             self.mem_guard_checker.process_watcher_status_changed.connect(self._on_process_watcher_status_changed)
             self._on_process_watcher_status_changed(getattr(self.mem_guard_checker, "process_watcher_status", None))
         self.mem_guard_thread.start()
+        self._active_config_signature = target_signature
 
     def _on_process_watcher_status_changed(self, status) -> None:
         if status is None:
@@ -256,4 +290,5 @@ class MemGuardController:
                 return False
         self.mem_guard_checker = None
         self.mem_guard_thread = None
+        self._active_config_signature = None
         return True

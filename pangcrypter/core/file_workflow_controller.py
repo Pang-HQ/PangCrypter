@@ -382,7 +382,6 @@ class FileWorkflowController:
                 )
 
             self.host.status_bar.showMessage("File opened successfully", 3000)
-            PangMessageBox.information(self.host, "Success", "File opened successfully.")
             self.host.update_file_info_label()
             _mark("ui_finalize")
 
