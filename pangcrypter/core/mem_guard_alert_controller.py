@@ -66,7 +66,6 @@ class MemGuardAlertController:
                 details += "\nWarning: could not save panic snapshot, unsaved work may be lost."
             msg.setText(details)
             continue_btn = msg.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
-            remember_btn = msg.addButton("Continue and remember this app hash", QMessageBox.ButtonRole.AcceptRole)
             whitelist_btn = msg.addButton("Whitelist this application", QMessageBox.ButtonRole.AcceptRole)
             exit_btn = msg.addButton("Exit program", QMessageBox.ButtonRole.DestructiveRole)
             msg.setMinimumWidth(640)
@@ -80,7 +79,7 @@ class MemGuardAlertController:
                 self.host.close()
                 return
 
-            should_remember = clicked in (remember_btn, whitelist_btn)
+            should_remember = clicked == whitelist_btn
             if clicked == continue_btn:
                 should_remember = False
 
