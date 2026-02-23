@@ -22,7 +22,7 @@ from .format_config import (
 )
 from ..utils.system_binaries import resolve_trusted_binary
 from uuid import UUID
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +33,11 @@ KEY_VERSION = 0x01
 
 _HWID_CACHE: dict[str, bytes] = {}
 
+keyring_module: Any | None
 try:
-    import keyring
+    import keyring as keyring_module
 except ImportError:
-    keyring = None
+    keyring_module = None
 
 KEYRING_SERVICE = "PangCrypter"
 
@@ -49,13 +50,14 @@ def get_file_id(path: str) -> str:
         raise FileNotFoundError(path)
 
     with open(path, "rb") as f:
-        data = f.read()
+        settings = f.read(SETTINGS_SIZE)
+        if len(settings) != SETTINGS_SIZE:
+            raise ValueError("File too short to contain a UUID")
 
-    min_len = SETTINGS_SIZE + SALT_SIZE + UUID_SIZE
-    if len(data) < min_len:
-        raise ValueError("File too short to contain a UUID")
+        salt_and_uuid = f.read(SALT_SIZE + UUID_SIZE)
+        if len(salt_and_uuid) != SALT_SIZE + UUID_SIZE:
+            raise ValueError("File too short to contain a UUID")
 
-    settings = data[:SETTINGS_SIZE]
     version = decode_version(settings[0:2])
     if version != HEADER_VERSION:
         raise ValueError(f"Unsupported file version: {version}")
@@ -66,9 +68,7 @@ def get_file_id(path: str) -> str:
     except ValueError:
         raise ValueError(f"Invalid mode byte: {mode_byte}")
 
-    uuid_start = SETTINGS_SIZE + SALT_SIZE
-    uuid_end = uuid_start + UUID_SIZE
-    uuid_bytes = data[uuid_start:uuid_end]
+    uuid_bytes = salt_and_uuid[SALT_SIZE:SALT_SIZE + UUID_SIZE]
 
     return uuid_bytes.hex()
 
@@ -183,34 +183,51 @@ def _write_secret_to_file(folder: str, secret_path: str, secret: bytes) -> None:
 
 def get_or_create_drive_secret(drive_root: str) -> bytes:
     """
-    Load or generate a per-drive secret stored in OS keychain when available.
-    Falls back to .pangcrypt_keys/secret.bin on the USB drive.
+    Load or generate a per-drive secret.
+
+    Portability/security model:
+    - The canonical secret is stored on the USB itself at
+      .pangcrypt_keys/secret.bin so encrypted material remains usable across
+      machines with the same USB.
+    - OS keyring, when available, is best-effort convenience cache only.
+
+    Backward compatibility:
+    - Older installs may have stored the secret only in keyring.
+      If found, migrate it to secret.bin on the drive.
     """
     folder = os.path.join(drive_root, KEY_FOLDER)
     secret_path = os.path.join(folder, "secret.bin")
 
-    if keyring:
-        try:
-            stored = keyring.get_password(KEYRING_SERVICE, _drive_keyring_id(drive_root))
-            if stored:
-                return bytes.fromhex(stored)
-        except (ValueError, RuntimeError) as e:
-            logger.warning("Failed to load drive secret from keyring: %s", e)
-
     secret = _read_secret_from_file(secret_path)
-    if secret:
+    if secret is not None:
+        if keyring_module:
+            try:
+                keyring_module.set_password(KEYRING_SERVICE, _drive_keyring_id(drive_root), secret.hex())
+            except RuntimeError as e:
+                logger.warning("Failed to sync drive secret to keyring: %s", e)
         return secret
 
-    secret = os.urandom(KEY_SIZE)
-
-    if keyring:
+    if keyring_module:
         try:
-            keyring.set_password(KEYRING_SERVICE, _drive_keyring_id(drive_root), secret.hex())
-            return secret
+            stored = keyring_module.get_password(KEYRING_SERVICE, _drive_keyring_id(drive_root))
+            if stored:
+                secret = bytes.fromhex(stored)
+                if len(secret) != KEY_SIZE:
+                    raise ValueError("Invalid drive secret size in keyring")
+                _write_secret_to_file(folder, secret_path, secret)
+                return secret
+        except (ValueError, RuntimeError, OSError) as e:
+            logger.warning("Failed to migrate drive secret from keyring: %s", e)
+
+    secret = os.urandom(KEY_SIZE)
+    _write_secret_to_file(folder, secret_path, secret)
+
+    if keyring_module:
+        try:
+            keyring_module.set_password(KEYRING_SERVICE, _drive_keyring_id(drive_root), secret.hex())
         except RuntimeError as e:
             logger.warning("Failed to store drive secret in keyring: %s", e)
 
-    _write_secret_to_file(folder, secret_path, secret)
     return secret
 
 def encrypt_random_key(random_key: bytes, hardware_id: bytes, drive_secret: bytes) -> bytes:
@@ -360,8 +377,8 @@ def get_drive_hardware_id(drive_path: str) -> bytes:
     elif system == "Linux":
         try:
             blkid_binary = resolve_trusted_binary("blkid", ["/usr/sbin/blkid", "/sbin/blkid", "/usr/bin/blkid"])
-            result = subprocess.run([blkid_binary, "-s", "UUID", "-o", "value", drive_path], capture_output=True, text=True, check=True)
-            uuid_str = result.stdout.strip()
+            linux_result = subprocess.run([blkid_binary, "-s", "UUID", "-o", "value", drive_path], capture_output=True, text=True, check=True)
+            uuid_str = linux_result.stdout.strip()
             if uuid_str:
                 hwid = hashlib.sha256(uuid_str.encode('utf-8')).digest()
                 _HWID_CACHE[normalized_drive] = hwid
@@ -373,8 +390,8 @@ def get_drive_hardware_id(drive_path: str) -> bytes:
         # Use diskutil info -plist <drive> and parse plist for VolumeUUID
         try:
             diskutil_binary = resolve_trusted_binary("diskutil", ["/usr/sbin/diskutil", "/usr/bin/diskutil"])
-            result = subprocess.run([diskutil_binary, "info", "-plist", drive_path], capture_output=True, check=True)
-            plist = plistlib.loads(result.stdout)
+            mac_result = subprocess.run([diskutil_binary, "info", "-plist", drive_path], capture_output=True, check=True)
+            plist = plistlib.loads(mac_result.stdout)
             volume_uuid = plist.get("VolumeUUID", None)
             if volume_uuid:
                 hwid = hashlib.sha256(volume_uuid.encode('utf-8')).digest()
@@ -398,7 +415,7 @@ def generate_secure_key() -> bytes:
     return os.urandom(KEY_SIZE)
 
 
-def get_key_path(drive_root: str, path: str, uuid: UUID) -> str:
+def get_key_path(drive_root: str, uuid: UUID) -> str:
     """Returns the full path to the key file inside the hidden folder."""
     folder = os.path.join(drive_root, KEY_FOLDER)
     os.makedirs(folder, exist_ok=True)
@@ -427,7 +444,7 @@ def create_or_load_key(drive_name: str, path: str, uuid: Optional[UUID] = None, 
     if not file_uuid:
         raise ValueError("No UUID provided and could not derive from file.")
     
-    key_path = get_key_path(drive_root, path, file_uuid)
+    key_path = get_key_path(drive_root, file_uuid)
     hardware_id = get_drive_hardware_id(drive_root)
     drive_secret = get_or_create_drive_secret(drive_root)
 
@@ -468,6 +485,12 @@ def create_or_load_key(drive_name: str, path: str, uuid: Optional[UUID] = None, 
         return None, None
 
     return random_key, file_uuid
+
+
+
+
+
+
 
 
 

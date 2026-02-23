@@ -29,6 +29,12 @@ from .format_config import (
     NONCE_SIZE,
     CONTENT_MODE_PLAINTEXT,
     CONTENT_MODE_HTML,
+    KDF_TIME_COST_OFFSET,
+    KDF_MEMORY_COST_KIB_OFFSET,
+    KDF_PARALLELISM_OFFSET,
+    DEFAULT_KDF_TIME_COST,
+    DEFAULT_KDF_MEMORY_COST_KIB,
+    DEFAULT_KDF_PARALLELISM,
     encode_version,
     decode_version,
 )
@@ -51,7 +57,14 @@ def _normalize_password_bytes(password: Union[str, bytes, bytearray]) -> bytes:
     raise TypeError("password must be str, bytes, or bytearray")
 
 
-def derive_key_from_password(password: Union[str, bytes, bytearray], salt: bytes) -> bytes:
+def derive_key_from_password(
+    password: Union[str, bytes, bytearray],
+    salt: bytes,
+    *,
+    time_cost: int = DEFAULT_KDF_TIME_COST,
+    memory_cost_kib: int = DEFAULT_KDF_MEMORY_COST_KIB,
+    parallelism: int = DEFAULT_KDF_PARALLELISM,
+) -> bytes:
     """
     Normalize the password and derive a fixed-length key using Argon2id.
     """
@@ -63,12 +76,30 @@ def derive_key_from_password(password: Union[str, bytes, bytearray], salt: bytes
     return hash_secret_raw(
         secret=normalized,
         salt=salt,
-        time_cost=3,
-        memory_cost=65536,
-        parallelism=1,
+        time_cost=int(time_cost),
+        memory_cost=int(memory_cost_kib),
+        parallelism=int(parallelism),
         hash_len=KEY_SIZE,
         type=Type.ID
     )
+
+
+def _encode_kdf_params(settings: bytearray) -> None:
+    settings[KDF_TIME_COST_OFFSET] = int(DEFAULT_KDF_TIME_COST) & 0xFF
+    # Store memory in MiB units to fit in one byte while keeping practical range.
+    settings[KDF_MEMORY_COST_KIB_OFFSET] = max(1, min(255, int(DEFAULT_KDF_MEMORY_COST_KIB // 1024)))
+    settings[KDF_PARALLELISM_OFFSET] = int(DEFAULT_KDF_PARALLELISM) & 0xFF
+
+
+def _decode_kdf_params(settings: bytes) -> tuple[int, int, int]:
+    time_cost = int(settings[KDF_TIME_COST_OFFSET] or DEFAULT_KDF_TIME_COST)
+    mem_mib = int(settings[KDF_MEMORY_COST_KIB_OFFSET] or (DEFAULT_KDF_MEMORY_COST_KIB // 1024))
+    parallelism = int(settings[KDF_PARALLELISM_OFFSET] or DEFAULT_KDF_PARALLELISM)
+
+    time_cost = max(1, min(16, time_cost))
+    mem_mib = max(8, min(255, mem_mib))
+    parallelism = max(1, min(8, parallelism))
+    return time_cost, mem_mib * 1024, parallelism
 
 
 def _combine_pw_and_key_with_hkdf(pw_key: bytes, usb_key: bytes) -> bytes:
@@ -118,6 +149,7 @@ def encrypt_file(input_bytes: bytes, output_path: str,
     settings[0:2] = encode_version(HEADER_VERSION)
     settings[MODE_OFFSET] = mode.value
     settings[CONTENT_MODE_OFFSET] = content_mode
+    _encode_kdf_params(settings)
 
     if mode == EncryptModeType.MODE_PASSWORD_ONLY:
         if not password:
@@ -157,7 +189,9 @@ def encrypt_file(input_bytes: bytes, output_path: str,
     )
 
     with open(output_path, "wb") as f:
-        f.write(header + nonce + ciphertext)
+        f.write(header)
+        f.write(nonce)
+        f.write(ciphertext)
 
 
 def decrypt_file(input_path: str,
@@ -167,14 +201,29 @@ def decrypt_file(input_path: str,
     if not os.path.exists(input_path):
         raise FileNotFoundError(input_path)
 
-    with open(input_path, "rb") as f:
-        data = f.read()
-
     min_len = SETTINGS_SIZE + SALT_SIZE + UUID_SIZE + NONCE_SIZE + 16
-    if len(data) < min_len:
+    if os.path.getsize(input_path) < min_len:
         raise ValueError("Input file is too short or corrupted")
 
-    settings = data[:SETTINGS_SIZE]
+    with open(input_path, "rb") as f:
+        settings = f.read(SETTINGS_SIZE)
+        if len(settings) != SETTINGS_SIZE:
+            raise ValueError("Input file is too short or corrupted")
+
+        salt = f.read(SALT_SIZE)
+        if len(salt) != SALT_SIZE:
+            raise ValueError("Input file is too short or corrupted")
+
+        file_uuid = f.read(UUID_SIZE)
+        if len(file_uuid) != UUID_SIZE:
+            raise ValueError("Input file is too short or corrupted")
+
+        nonce = f.read(NONCE_SIZE)
+        if len(nonce) != NONCE_SIZE:
+            raise ValueError("Input file is too short or corrupted")
+
+        ciphertext = f.read()
+
     version = decode_version(settings[0:2])
     if version != HEADER_VERSION:
         raise ValueError(f"Unsupported file version: {version}")
@@ -185,28 +234,31 @@ def decrypt_file(input_path: str,
     except ValueError:
         raise ValueError(f"Invalid mode byte: {mode_byte}")
 
-    salt_start = SETTINGS_SIZE
-    salt_end = salt_start + SALT_SIZE
-    uuid_start = salt_end
-    uuid_end = uuid_start + UUID_SIZE
-    nonce_start = uuid_end
-    nonce_end = nonce_start + NONCE_SIZE
-
-    salt = data[salt_start:salt_end]
-    nonce = data[nonce_start:nonce_end]
-    ciphertext = data[nonce_end:]
+    kdf_time_cost, kdf_memory_cost_kib, kdf_parallelism = _decode_kdf_params(settings)
 
     if mode == EncryptModeType.MODE_PASSWORD_ONLY:
         if not password:
             raise ValueError("Password is required for password-only mode")
-        key = derive_key_from_password(password, salt)
+        key = derive_key_from_password(
+            password,
+            salt,
+            time_cost=kdf_time_cost,
+            memory_cost_kib=kdf_memory_cost_kib,
+            parallelism=kdf_parallelism,
+        )
 
     elif mode == EncryptModeType.MODE_PASSWORD_PLUS_KEY:
         if not (password and usb_key):
             raise ValueError("Both password and key required for password+key mode")
         if len(usb_key) != KEY_SIZE:
             raise ValueError(f"usb_key must be exactly {KEY_SIZE} bytes")
-        pw_key = derive_key_from_password(password, salt)
+        pw_key = derive_key_from_password(
+            password,
+            salt,
+            time_cost=kdf_time_cost,
+            memory_cost_kib=kdf_memory_cost_kib,
+            parallelism=kdf_parallelism,
+        )
         key = _combine_pw_and_key_with_hkdf(pw_key, usb_key)
 
     elif mode == EncryptModeType.MODE_KEY_ONLY:
@@ -219,7 +271,7 @@ def decrypt_file(input_path: str,
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
-    header = data[:uuid_end]
+    header = settings + salt + file_uuid
 
     # Decrypt using the full header (settings + salt + UUID) as Associated Data.
     # Re-raise auth/tag failures as a dual-inheritance error so existing callers

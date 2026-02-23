@@ -4,8 +4,6 @@ import platform
 import ctypes
 from ctypes import wintypes
 
-from ..ui.messagebox import PangMessageBox
-
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +56,6 @@ def list_usb_drives() -> list[str]:
                 if os.path.ismount(vol_path) and os.access(vol_path, os.W_OK):
                     drives.append(vol_path)
     else:
-        PangMessageBox.warning(None, "Unsupported OS", "This script only supports Windows, Linux, and macOS.")
+        logger.warning("Unsupported OS for USB detection: %s", system)
 
     return drives

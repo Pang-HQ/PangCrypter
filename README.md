@@ -35,7 +35,7 @@ PangCrypter is an encrypted text editor for `.enc` files. It combines authentica
 
 - XChaCha20-Poly1305 authenticated encryption
 - Three encryption modes: password-only, USB-only, password+USB
-- File header includes version, mode, content mode, salt, UUID, nonce
+- File header includes version, mode, content mode, per-file KDF metadata, salt, UUID, nonce
 - Update verification with SHA-256 and minisign
 - Backup/rollback logic during update installation
 
@@ -142,12 +142,20 @@ settings (16 bytes):
   - bytes 0-1: version (uint16)
   - byte 2   : encryption mode
   - byte 3   : content mode (0x00 plaintext, 0x01 HTML)
-  - bytes 4-15: reserved
+  - byte 4   : Argon2 time cost (password modes)
+  - byte 5   : Argon2 memory cost in MiB units (password modes)
+  - byte 6   : Argon2 parallelism (password modes)
+  - bytes 7-15: reserved
 salt (16 bytes, zeroed for key-only mode)
 uuid (16 bytes)
 nonce (24 bytes)
 ciphertext (variable)
 ```
+
+Compatibility note:
+- Header **version remains v1**.
+- Older files (with zeroed reserved bytes) are still readable; decryption falls back to safe defaults.
+- New files write KDF metadata in reserved bytes 4-6 for future KDF tuning.
 
 ## Development
 

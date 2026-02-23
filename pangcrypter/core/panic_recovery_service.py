@@ -101,14 +101,16 @@ class PanicRecoveryService:
         usb_key: bytearray | None = None
         try:
             if self.host.current_mode in [EncryptModeType.MODE_PASSWORD_ONLY, EncryptModeType.MODE_PASSWORD_PLUS_KEY]:
-                from ..ui.main_ui import PasswordDialog
+                from ..ui.dialogs import PasswordDialog
                 pwd_dlg = PasswordDialog(self.host)
                 if not pwd_dlg.exec_():
+                    return False
+                if pwd_dlg.password is None:
                     return False
                 password_bytes = bytearray(pwd_dlg.password.encode("utf-8"))
 
             if self.host.current_mode in [EncryptModeType.MODE_PASSWORD_PLUS_KEY, EncryptModeType.MODE_KEY_ONLY]:
-                from ..ui.main_ui import USBSelectDialog
+                from ..ui.dialogs import USBSelectDialog
                 usbs = self.host.check_usb_present()
                 if not usbs:
                     return False

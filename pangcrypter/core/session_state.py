@@ -1,13 +1,14 @@
 import os
 from time import monotonic
 from typing import Optional
+from uuid import UUID
 
 
 class SessionState:
     def __init__(self):
         self.cached_password: Optional[bytearray] = None
         self.cached_usb_key: Optional[bytearray] = None
-        self.cached_uuid = None
+        self.cached_uuid: Optional[UUID] = None
         self._secret_mask = os.urandom(32)
         self._focus_lost_at: Optional[float] = None
         self._secret_cache_notice_logged = False
@@ -40,7 +41,12 @@ class SessionState:
         self.cached_uuid = None
 
     def effective_secret_cache_idle_minutes(self, preferences, default_minutes: int, max_minutes: int) -> int:
-        configured = int(getattr(preferences, "session_infocus_inactivity_minutes", default_minutes))
+        configured = getattr(preferences, "session_infocus_inactivity_minutes", default_minutes)
+        try:
+            configured = int(configured)
+        except (ValueError, TypeError):
+            configured = default_minutes
+
         return max(1, min(configured, max_minutes))
 
     def should_warn_secret_cache_limit(self, preferences) -> bool:

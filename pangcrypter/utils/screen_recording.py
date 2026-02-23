@@ -25,13 +25,17 @@ SCREEN_RECORDERS_LOWER = {
 class ScreenRecordingChecker(QObject):
     screen_recording_changed = pyqtSignal(bool)
 
-    def __init__(self, check_interval=1):
+    def __init__(self, check_interval=1, allowlist: set[str] | None = None):
         super().__init__()
         self.check_interval = check_interval
         self.running = True
         self._stop_event = Event()
         self._last_status = False
-        self.cached_procs = set()
+        self.cached_procs: set[str] = set()
+        self._allowlist = {str(item).strip().lower() for item in (allowlist or set()) if str(item).strip()}
+
+    def set_allowlist(self, process_names):
+        self._allowlist = {str(item).strip().lower() for item in (process_names or []) if str(item).strip()}
 
     def stop(self):
         self.running = False
@@ -52,9 +56,15 @@ class ScreenRecordingChecker(QObject):
                 new_procs = current_procs - self.cached_procs
                 self.cached_procs = current_procs
 
-                recording_detected = any(pname in SCREEN_RECORDERS_LOWER for pname in new_procs)
+                recording_detected = any(
+                    pname in SCREEN_RECORDERS_LOWER and pname not in self._allowlist
+                    for pname in new_procs
+                )
                 if self._last_status and not recording_detected:
-                    recording_detected = any(proc in SCREEN_RECORDERS_LOWER for proc in current_procs)
+                    recording_detected = any(
+                        proc in SCREEN_RECORDERS_LOWER and proc not in self._allowlist
+                        for proc in current_procs
+                    )
 
                 if recording_detected != self._last_status:
                     self._last_status = recording_detected
