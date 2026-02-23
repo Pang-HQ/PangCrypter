@@ -2,7 +2,7 @@ import zipfile
 
 import pytest
 
-from pangcrypter.core.updater import AutoUpdater, UpdaterError
+from pangcrypter.updater.service import AutoUpdater, UpdaterError
 
 
 def test_safe_extract_rejects_path_traversal(tmp_path):

@@ -1,10 +1,13 @@
 import json
+from collections import deque
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from pangcrypter.main import MainWindow
 from pangcrypter.core.mem_guard_controller import MemGuardController
-from pangcrypter.utils.preferences import Preferences
+from pangcrypter.preferences.preferences import Preferences
 import pangcrypter.utils.mem_guard as mem_guard
+from pangcrypter.utils.mem_guard.etw_process_watcher import _is_process_start_event
 
 
 class _FakeChecker:
@@ -42,9 +45,9 @@ def test_preferences_migrates_legacy_file(monkeypatch, tmp_path):
     legacy_payload = {"session_cache_enabled": False, "recording_cooldown": 42}
     legacy_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
 
-    monkeypatch.setattr("pangcrypter.utils.preferences.PREFERENCES_FILE", str(new_path))
-    monkeypatch.setattr("pangcrypter.utils.preferences.LEGACY_PREFERENCES_FILE", str(legacy_path))
-    monkeypatch.setattr("pangcrypter.utils.preferences.LEGACY_USER_CONFIG_FILES", [])
+    monkeypatch.setattr("pangcrypter.preferences.preferences.PREFERENCES_FILE", str(new_path))
+    monkeypatch.setattr("pangcrypter.preferences.preferences.LEGACY_PREFERENCES_FILE", str(legacy_path))
+    monkeypatch.setattr("pangcrypter.preferences.preferences.LEGACY_USER_CONFIG_FILES", [])
 
     prefs = Preferences()
     prefs.load_preferences()
@@ -88,7 +91,7 @@ def test_mem_guard_stop_failure_disables_until_restart(monkeypatch):
 
 def test_mem_guard_normal_write_trusted_system_is_log_only(monkeypatch):
     process_path = r"C:\Windows\System32\trusted.exe"
-    stat_key = (mem_guard._normalize_path(process_path), 1, 2)
+    stat_key: tuple[str, int, int] = (mem_guard._normalize_path(process_path), 1, 2)
 
     class _Proc:
         def name(self):
@@ -102,8 +105,10 @@ def test_mem_guard_normal_write_trusted_system_is_log_only(monkeypatch):
     monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
     monkeypatch.setattr(mem_guard, "_is_windows_system_path", lambda _p: True)
 
-    signature_cache = {stat_key: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0)}
-    hash_cache = {stat_key: "abc"}
+    signature_cache: dict[tuple[str, int, int], mem_guard.SigResult] = {
+        stat_key: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0)
+    }
+    hash_cache: dict[tuple[str, int, int], str] = {stat_key: "abc"}
     finding = mem_guard.enrich_pid_finding(
         123,
         mem_guard.PROCESS_VM_WRITE,
@@ -120,7 +125,7 @@ def test_mem_guard_normal_write_trusted_system_is_log_only(monkeypatch):
 
 def test_mem_guard_normal_read_trusted_non_system_alerts(monkeypatch):
     process_path = r"C:\Tools\overlay.exe"
-    stat_key = (mem_guard._normalize_path(process_path), 1, 2)
+    stat_key: tuple[str, int, int] = (mem_guard._normalize_path(process_path), 1, 2)
 
     class _Proc:
         def name(self):
@@ -134,8 +139,10 @@ def test_mem_guard_normal_read_trusted_non_system_alerts(monkeypatch):
     monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
     monkeypatch.setattr(mem_guard, "_is_windows_system_path", lambda _p: False)
 
-    signature_cache = {stat_key: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0)}
-    hash_cache = {stat_key: "abc"}
+    signature_cache: dict[tuple[str, int, int], mem_guard.SigResult] = {
+        stat_key: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0)
+    }
+    hash_cache: dict[tuple[str, int, int], str] = {stat_key: "abc"}
     finding = mem_guard.enrich_pid_finding(
         234,
         mem_guard.PROCESS_VM_READ,
@@ -152,7 +159,7 @@ def test_mem_guard_normal_read_trusted_non_system_alerts(monkeypatch):
 
 def test_mem_guard_ultra_aggressive_keeps_write_only(monkeypatch):
     process_path = r"C:\Temp\proc.exe"
-    stat_key = (mem_guard._normalize_path(process_path), 1, 2)
+    stat_key: tuple[str, int, int] = (mem_guard._normalize_path(process_path), 1, 2)
 
     class _Proc:
         def name(self):
@@ -165,8 +172,10 @@ def test_mem_guard_ultra_aggressive_keeps_write_only(monkeypatch):
     monkeypatch.setattr(mem_guard.os.path, "exists", lambda _p: True)
     monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
 
-    signature_cache = {stat_key: mem_guard.SigResult(mem_guard.SigTrust.UNKNOWN, 0)}
-    hash_cache = {stat_key: "abc"}
+    signature_cache: dict[tuple[str, int, int], mem_guard.SigResult] = {
+        stat_key: mem_guard.SigResult(mem_guard.SigTrust.UNKNOWN, 0)
+    }
+    hash_cache: dict[tuple[str, int, int], str] = {stat_key: "abc"}
     finding = mem_guard.enrich_pid_finding(
         345,
         mem_guard.PROCESS_VM_WRITE,
@@ -244,7 +253,7 @@ def test_parent_lineage_program_files_trusted_not_suspicious(monkeypatch):
 def test_enrich_pid_finding_uses_normalized_stat_cache_key(monkeypatch):
     process_path = r"C:\Temp\Example.EXE"
     normalized_path = process_path.lower()
-    stat_key = (normalized_path, 1, 2)
+    stat_key: tuple[str, int, int] = (normalized_path, 1, 2)
 
     class _Proc:
         def name(self):
@@ -257,7 +266,9 @@ def test_enrich_pid_finding_uses_normalized_stat_cache_key(monkeypatch):
     monkeypatch.setattr(mem_guard.os.path, "exists", lambda _p: True)
     monkeypatch.setattr(mem_guard.os, "stat", lambda _p, *_a, **_k: SimpleNamespace(st_mtime=1, st_size=2))
 
-    signature_cache = {stat_key: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0)}
+    signature_cache: dict[tuple[str, int, int], mem_guard.SigResult] = {
+        stat_key: mem_guard.SigResult(mem_guard.SigTrust.SIGNED_TRUSTED, 0)
+    }
     hash_cache = {}
 
     finding = mem_guard.enrich_pid_finding(
@@ -311,3 +322,113 @@ def test_enrich_pid_finding_skips_sha256_when_no_whitelist_hash(monkeypatch):
 
     assert finding is not None
     assert called["sha"] == 0
+
+
+def test_mem_guard_alert_whitelist_path_compare_is_normalized():
+    from pangcrypter.core.mem_guard_alert_controller import MemGuardAlertController
+
+    class _FakeMsg:
+        def __init__(self, _parent):
+            self._continue = object()
+            self._whitelist = object()
+            self._exit = object()
+            self._clicked = self._whitelist
+
+        def setWindowTitle(self, _title):
+            return None
+
+        def setText(self, _text):
+            return None
+
+        def addButton(self, label, _role):
+            if "Whitelist" in label:
+                return self._whitelist
+            if "Exit" in label:
+                return self._exit
+            return self._continue
+
+        def setMinimumWidth(self, _w):
+            return None
+
+        def adjustSize(self):
+            return None
+
+        def buttons(self):
+            return []
+
+        def exec(self):
+            return None
+
+        def clickedButton(self):
+            return self._clicked
+
+        class StandardButton:
+            Yes = 1
+            No = 2
+
+        @staticmethod
+        def question(_parent, _title, _text, buttons=None, default=None):
+            _ = (buttons, default)
+            return _FakeMsg.StandardButton.Yes
+
+    class _FakeEditor:
+        def clear(self):
+            return None
+
+    class _FakePrivacy:
+        def hide_editor_and_show_label(self):
+            return None
+
+        def try_restore_editor(self):
+            return True
+
+    class _FakePanic:
+        def create_snapshot(self):
+            return True
+
+        def restore_snapshot(self):
+            return True
+
+    host = SimpleNamespace(
+        editor=_FakeEditor(),
+        privacy_guard=_FakePrivacy(),
+        mem_guard_controller=SimpleNamespace(configure=lambda: None),
+    )
+    host.clear_cached_secrets = lambda: None
+    host._ensure_panic_recovery_service = lambda: _FakePanic()
+    host.close = lambda: None
+
+    finding = SimpleNamespace(
+        pid=1,
+        severity=SimpleNamespace(value="high"),
+        access_mask=0x10,
+        process_name="TestProc",
+        process_path=r"C:\Tools\Example.EXE",
+        sha256="abc123",
+    )
+
+    existing_entry = {"path": r"c:\tools\example.exe", "sha256": "abc123"}
+    fake_prefs = SimpleNamespace(
+        mem_guard_whitelist=[existing_entry.copy()],
+        save_preferences=lambda: None,
+    )
+
+    with patch("pangcrypter.core.mem_guard_alert_controller.PangMessageBox", _FakeMsg), patch(
+        "pangcrypter.core.mem_guard_alert_controller.QMessageBox",
+        SimpleNamespace(ButtonRole=SimpleNamespace(AcceptRole=0, DestructiveRole=1)),
+    ), patch(
+        "pangcrypter.core.mem_guard_alert_controller.PangPreferences",
+        fake_prefs,
+    ):
+        controller = MemGuardAlertController(host)
+        assert isinstance(controller._pending_findings, deque)
+        controller.handle(finding)
+
+    assert len(fake_prefs.mem_guard_whitelist) == 1
+
+
+def test_etw_process_start_event_filter_logic():
+    assert _is_process_start_event(1, 1) is True
+    assert _is_process_start_event(0, 1) is True
+    assert _is_process_start_event(1, 2) is False
+    assert _is_process_start_event(2, 1) is False

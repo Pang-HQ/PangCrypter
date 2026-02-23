@@ -6,9 +6,9 @@ import tempfile
 from uuid import uuid4
 
 import pytest
-from nacl.exceptions import CryptoError
 
 from pangcrypter.core.encrypt import EncryptModeType, encrypt_file, decrypt_file
+from pangcrypter.core.errors import DecryptionAuthError
 from pangcrypter.core.key import generate_secure_key
 
 
@@ -94,7 +94,7 @@ def test_error_conditions():
             test_uuid,
             password="CorrectPassword123!",
         )
-        with pytest.raises(CryptoError):
+        with pytest.raises(DecryptionAuthError):
             decrypt_file(wrong_pw_path, password="WrongPassword456!")
     finally:
         _cleanup(wrong_pw_path)
@@ -112,7 +112,7 @@ def test_error_conditions():
             wrong_key_uuid,
             usb_key=correct_key,
         )
-        with pytest.raises(CryptoError):
+        with pytest.raises(DecryptionAuthError):
             decrypt_file(wrong_key_path, usb_key=wrong_key)
     finally:
         _cleanup(wrong_key_path)
